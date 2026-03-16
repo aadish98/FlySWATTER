@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flyswatter"
+version = "0.1.0"
+description = "Fly Sleep-Wake Arousal Threshold Testing & Evaluation Resource desktop app"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "PySide6",
+  "pandas",
+  "numpy",
+  "matplotlib",
+  "scipy",
+  "openpyxl",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pyinstaller>=6",
+]
+
+[project.scripts]
+flyswatter = "flyswatter_gui:main"
+
+[tool.setuptools]
+py-modules = ["flyswatter_gui", "ScoreArousability", "ConvertAcclLogsToPlots"]
+
+[tool.setuptools.packages.find]
+include = ["gui*", "services*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

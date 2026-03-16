@@ -1,0 +1,31 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+.venv/
+.venv-py310/
+venv/
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.app
+
+# Runtime output produced by the app
+Data/
+logs/
+BATCH_SCRIPTS/logs/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
