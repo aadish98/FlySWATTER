@@ -27,7 +27,7 @@ bash BATCH_SCRIPTS/build_flyswatter_mac_app.sh
 ## Quick start — Windows
 
 1. Install [Git](https://git-scm.com/download/win) and [Python 3.10+](https://www.python.org/downloads/) (check **"Add python.exe to PATH"** during install).
-2. Right-click the folder where you want the project (e.g. Desktop) -> **Open in Terminal**.
+2. Right-click the folder where you want the project (e.g. Desktop) -> **Open in Terminal** (Windows 11) or **Shift + right-click** -> **Open PowerShell window here** (Windows 10).
 3. Run these commands one at a time:
 
 ```powershell
