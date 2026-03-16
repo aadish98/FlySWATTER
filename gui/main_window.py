@@ -175,7 +175,7 @@ class FlySwatterMainWindow(QMainWindow):
         self._current_worker = worker
         self.score_progress_screen.start_indeterminate(
             f"Scoring sleep & arousal using {self.state.score_sleep_minutes} minute inactivity threshold\u2026\n"
-            "Processing typically takes ~2 minutes to complete."
+            "Processing typically takes ~2-6 minutes to complete."
         )
         self.stack.setCurrentWidget(self.score_progress_screen)
         self.thread_pool.start(worker)
@@ -248,8 +248,14 @@ class FlySwatterMainWindow(QMainWindow):
             )
         except Exception:
             n_files = len(self._pulse_folder_summary.csv_files) if self._pulse_folder_summary else 1
-        estimated_seconds = max(n_files, 1) * 90
-        self.pulse_progress_screen.start_timed(estimated_seconds, "Starting pulse metrics analysis\u2026")
+        n_files = max(n_files, 1)
+        est_min = n_files * 90
+        est_max = n_files * 240
+        self.pulse_progress_screen.start_timed(
+            est_min,
+            "Starting pulse metrics analysis\u2026",
+            estimated_seconds_max=est_max,
+        )
         self.stack.setCurrentWidget(self.pulse_progress_screen)
         self.thread_pool.start(worker)
 
