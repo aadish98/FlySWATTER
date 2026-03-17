@@ -51,6 +51,7 @@ if (Test-Path $outputExe) {
 
 $entrypoint = Join-Path $projectDir "flyswatter_gui.py"
 $mappingFile = Join-Path $projectDir "arousal_score_well_mapping.xlsx"
+$iconFile = Join-Path $projectDir "assets\flyswatter_icon-new.png"
 
 Write-Host "Building FlySWATTER.exe in project root..."
 & $venvPython -m PyInstaller `
@@ -61,6 +62,7 @@ Write-Host "Building FlySWATTER.exe in project root..."
     --name "FlySWATTER" `
     --distpath $projectDir `
     --workpath $workPath `
+    --icon $iconFile `
     --hidden-import "ConvertAcclLogsToPlots" `
     --hidden-import "ScoreArousability" `
     --hidden-import "openpyxl.styles" `

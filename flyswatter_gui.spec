@@ -56,6 +56,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="FlySWATTER.app",
-    icon=None,
+    icon="assets/flyswatter_icon-new.png",
     bundle_identifier="edu.umich.rallada.flyswatter",
 )
