@@ -1,4 +1,4 @@
-# FlySWATTER
+# FlySWATTER — Fly Sleep-Wake Arousal Threshold Testing & Evaluation Resource
 
 Desktop app for scoring Zantiks fly behavior data and computing pulse metrics from accelerometer logs.
 
