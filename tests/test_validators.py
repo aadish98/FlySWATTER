@@ -19,6 +19,13 @@ def test_valid_score_file_name_is_accepted(tmp_path: Path):
     assert result.valid
 
 
+def test_mm_dd_yyyy_3day_score_file_name_is_accepted(tmp_path: Path):
+    file_path = tmp_path / "07-24-2026_arousal_experiment_script_3Day_protocol-20260724T145656.csv"
+    file_path.write_text("RUNTIME,VIB,DAY,HOUR,TIME_BIN\n", encoding="utf-8")
+    result = validate_score_file(file_path)
+    assert result.valid
+
+
 def test_renamed_score_file_is_rejected(tmp_path: Path):
     file_path = tmp_path / "renamed_file.csv"
     file_path.write_text("RUNTIME,VIB,DAY,HOUR,TIME_BIN\n", encoding="utf-8")

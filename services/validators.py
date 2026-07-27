@@ -9,7 +9,7 @@ from typing import Iterable, List
 from services.models import ValidationResult
 
 ZANTIKS_SCORE_PATTERN = re.compile(
-    r"^\d{6}_arousal_experiment_script_2Day_protocol-\d{8}T\d{6}\.(csv|xlsx)$",
+    r"^(\d{6}|\d{2}-\d{2}-\d{4})_arousal_experiment_script_\d+Day_protocol-\d{8}T\d{6}\.(csv|xlsx)$",
     re.IGNORECASE,
 )
 ACCEL_FOLDER_PATTERN = re.compile(r"^\d{2}-\d{2}-\d{4} T-\d{1,2}\.\d{2}(am|pm)$", re.IGNORECASE)
