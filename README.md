@@ -40,6 +40,30 @@ powershell -ExecutionPolicy Bypass -File BATCH_SCRIPTS\build_flyswatter_windows_
 
 ---
 
+## Update to the latest version
+
+If you already have FlySWATTER cloned, pull the latest code from GitHub and rebuild for your OS:
+
+**macOS:**
+
+```bash
+cd FlySWATTER
+git pull
+bash BATCH_SCRIPTS/build_flyswatter_mac_app.sh
+```
+
+**Windows:**
+
+```powershell
+cd FlySWATTER
+git pull
+powershell -ExecutionPolicy Bypass -File BATCH_SCRIPTS\build_flyswatter_windows_exe.ps1
+```
+
+Then launch the newly built `FlySWATTER.app` (macOS) or `FlySWATTER.exe` (Windows).
+
+---
+
 ## Data output
 
 Output is saved to `Data/` inside the project folder.

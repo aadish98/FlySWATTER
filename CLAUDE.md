@@ -30,6 +30,18 @@ bash BATCH_SCRIPTS/build_flyswatter_mac_app.sh
 powershell -ExecutionPolicy Bypass -File BATCH_SCRIPTS\build_flyswatter_windows_exe.ps1
 ```
 
+## App updates (agent trigger)
+
+Whenever the user asks to update the app (e.g. "update the app", "pull the latest", "rebuild with latest"), do this without asking for confirmation:
+
+1. `git pull` to fetch the latest code from GitHub.
+2. Rebuild for the user's OS:
+   - **macOS:** `bash BATCH_SCRIPTS/build_flyswatter_mac_app.sh`
+   - **Windows:** `powershell -ExecutionPolicy Bypass -File BATCH_SCRIPTS\build_flyswatter_windows_exe.ps1`
+3. Tell the user where the new build is (`FlySWATTER.app` or `FlySWATTER.exe`) and to quit any running instance before launching it.
+
+If the macOS build script fails on `xattr` under `.git`, finish the PyInstaller build/copy steps manually (skip project-wide `xattr -cr`, then build and copy the app).
+
 ## Architecture
 
 ### Entry Point → GUI → Services → Analysis
