@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = [
     ("arousal_score_well_mapping.xlsx", "."),
+    ("zantiks_filename_format.html", "."),
 ]
 datas += collect_data_files("matplotlib", include_py_files=False)
 

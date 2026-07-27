@@ -12,6 +12,7 @@ class ValidationResult:
     valid: bool
     message: str = ""
     details: List[str] = field(default_factory=list)
+    help_document: Optional[str] = None
 
 
 @dataclass

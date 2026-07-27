@@ -5,7 +5,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtCore import Qt, QThreadPool, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QMainWindow,
@@ -114,7 +115,11 @@ class FlySwatterMainWindow(QMainWindow):
     def _handle_researcher_continue(self, researcher_name: str) -> None:
         validation = validate_researcher_name(researcher_name)
         if not validation.valid:
-            self._show_error(validation.message, validation.details)
+            self._show_error(
+                validation.message,
+                validation.details,
+                help_document=validation.help_document,
+            )
             return
         self.state.researcher_name = researcher_name.strip()
         save_researcher_name(self.data_root, self.state.researcher_name)
@@ -135,7 +140,11 @@ class FlySwatterMainWindow(QMainWindow):
     def _handle_score_file_selected(self, file_path: str) -> None:
         validation = validate_score_file(file_path)
         if not validation.valid:
-            self._show_error(validation.message, validation.details)
+            self._show_error(
+                validation.message,
+                validation.details,
+                help_document=validation.help_document,
+            )
             return
         self.state.selected_score_file = Path(file_path)
         self.state.genotype_order = get_default_genotype_order()
@@ -200,7 +209,11 @@ class FlySwatterMainWindow(QMainWindow):
     def _handle_pulse_folder_selected(self, folder_path: str) -> None:
         validation = validate_accel_folder(folder_path)
         if not validation.valid:
-            self._show_error(validation.message, validation.details)
+            self._show_error(
+                validation.message,
+                validation.details,
+                help_document=validation.help_document,
+            )
             return
         self.state.selected_pulse_folder = Path(folder_path)
         worker = FunctionWorker(get_folder_window_summary, folder_path)
@@ -296,7 +309,7 @@ class FlySwatterMainWindow(QMainWindow):
         self._show_error("Analysis failed.", [message])
         self.stack.setCurrentWidget(self.choose_screen)
 
-    def _show_error(self, message: str, details=None) -> None:
+    def _show_error(self, message: str, details=None, help_document: str | None = None) -> None:
         details = details or []
         dialog = QMessageBox(self)
         dialog.setIcon(QMessageBox.Critical)
@@ -304,4 +317,21 @@ class FlySwatterMainWindow(QMainWindow):
         dialog.setText(message)
         if details:
             dialog.setInformativeText("\n".join(details))
+
+        help_path = self._resolve_help_document(help_document)
+        open_guide_button = None
+        if help_path is not None:
+            open_guide_button = dialog.addButton("Open filename guide", QMessageBox.ActionRole)
+            dialog.addButton(QMessageBox.Ok)
+
         dialog.exec()
+        if open_guide_button is not None and dialog.clickedButton() == open_guide_button:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(help_path)))
+
+    def _resolve_help_document(self, help_document: str | None) -> Path | None:
+        if not help_document:
+            return None
+        candidate = self.resource_root / help_document
+        if candidate.is_file():
+            return candidate
+        return None

@@ -18,7 +18,7 @@ from matplotlib.artist import setp as _mpl_setp
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
-from matplotlib.ticker import FuncFormatter, MultipleLocator, NullFormatter
+from matplotlib.ticker import FuncFormatter, MultipleLocator
 
 from ScoreArousability import (
     _ensure_numeric,
@@ -882,24 +882,25 @@ def _format_sleep_xaxis(ax, use_wc_sleep: bool):
         _apply_wall_clock_xaxis(ax)
         ax.set_xlabel("Wall Clock Time")
     else:
+        ax.xaxis.set_major_locator(MultipleLocator(0.5))
         ax.set_xlabel("Time (hours from start)")
+        _mpl_setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        ax.tick_params(axis="x", which="major", length=8, width=1.2)
 
 
 def _apply_wall_clock_xaxis(ax) -> None:
-    ax.xaxis.set_major_locator(mdates.HourLocator(interval=2))
-    ax.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0, 30]))
+    # Always label every 30 minutes so short and partial runs still have readable ticks.
+    ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=[0, 30]))
 
     def _major_fmt(value, _pos):
         dt_val = mdates.num2date(value)
         if getattr(dt_val, "tzinfo", None) is not None:
             dt_val = dt_val.replace(tzinfo=None)
-        return dt_val.strftime("%I %p").lstrip("0")
+        return dt_val.strftime("%I:%M %p").lstrip("0")
 
     ax.xaxis.set_major_formatter(FuncFormatter(_major_fmt))
-    ax.xaxis.set_minor_formatter(NullFormatter())
     _mpl_setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right", rotation_mode="anchor")
     ax.tick_params(axis="x", which="major", length=8, width=1.2)
-    ax.tick_params(axis="x", which="minor", length=4, width=0.6)
 
 
 def _to_is_light(value):

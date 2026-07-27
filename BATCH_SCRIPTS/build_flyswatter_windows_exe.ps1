@@ -51,6 +51,7 @@ if (Test-Path $outputExe) {
 
 $entrypoint = Join-Path $projectDir "flyswatter_gui.py"
 $mappingFile = Join-Path $projectDir "arousal_score_well_mapping.xlsx"
+$filenameGuide = Join-Path $projectDir "zantiks_filename_format.html"
 $iconPng = Join-Path $projectDir "assets\flyswatter_icon-new.png"
 $iconFile = Join-Path $projectDir "build\flyswatter.ico"
 
@@ -89,6 +90,7 @@ Write-Host "Building FlySWATTER.exe in project root..."
     --hidden-import "openpyxl.styles" `
     --collect-submodules "matplotlib.backends" `
     --add-data "$mappingFile;." `
+    --add-data "$filenameGuide;." `
     $entrypoint
 
 if (-not (Test-Path $outputExe)) {

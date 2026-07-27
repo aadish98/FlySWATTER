@@ -32,6 +32,7 @@ def test_renamed_score_file_is_rejected(tmp_path: Path):
     result = validate_score_file(file_path)
     assert not result.valid
     assert "modified" in result.message.lower()
+    assert result.help_document == "zantiks_filename_format.html"
 
 
 def test_valid_accelerometer_folder_is_accepted(tmp_path: Path):

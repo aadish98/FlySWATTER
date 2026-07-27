@@ -36,7 +36,9 @@ class ScoreUploadScreen(QWidget):
         title.setStyleSheet("font-size: 22px; font-weight: 700;")
 
         instructions = QLabel(
-            "Drag and drop a Zantiks file here, or browse to select it. The filename must match the original exported format."
+            "Drag and drop a Zantiks file here, or browse to select it. "
+            "The filename must match the original exported format. "
+            "If the name is rejected, open the filename guide from the error dialog."
         )
         instructions.setWordWrap(True)
 

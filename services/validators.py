@@ -38,9 +38,10 @@ def validate_score_file(path: str | Path) -> ValidationResult:
             False,
             "The Zantiks filename appears to have been modified.",
             [
-                "Please re-download the Zantiks file from the system.",
-                "Upload it again without changing the filename.",
+                "Please re-download the Zantiks file from the system, or restore the original filename format.",
+                "Open the filename guide for the required format and which part to edit for clock drift.",
             ],
+            help_document="zantiks_filename_format.html",
         )
     return ValidationResult(True)
 
