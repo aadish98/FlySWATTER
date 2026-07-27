@@ -51,7 +51,28 @@ if (Test-Path $outputExe) {
 
 $entrypoint = Join-Path $projectDir "flyswatter_gui.py"
 $mappingFile = Join-Path $projectDir "arousal_score_well_mapping.xlsx"
-$iconFile = Join-Path $projectDir "assets\flyswatter_icon-new.png"
+$iconPng = Join-Path $projectDir "assets\flyswatter_icon-new.png"
+$iconFile = Join-Path $projectDir "build\flyswatter.ico"
+
+if (-not (Test-Path $iconPng)) {
+    throw "App icon not found at $iconPng"
+}
+
+# Build a multi-size .ico from the source PNG. PyInstaller's PNG→ICO helper hashes the
+# *path* (not contents), so Explorer can keep showing a stale icon after rebuilds.
+Write-Host "Building app icon (.ico) from $iconPng..."
+& $venvPython -c @"
+from pathlib import Path
+from PIL import Image
+
+png = Path(r'$iconPng')
+ico = Path(r'$iconFile')
+ico.parent.mkdir(parents=True, exist_ok=True)
+img = Image.open(png).convert('RGBA')
+sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+img.save(ico, sizes=sizes)
+print(f'Wrote {ico}')
+"@
 
 Write-Host "Building FlySWATTER.exe in project root..."
 & $venvPython -m PyInstaller `

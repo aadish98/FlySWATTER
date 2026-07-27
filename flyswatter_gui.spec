@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 datas = [
@@ -13,6 +15,12 @@ hiddenimports = [
     "openpyxl.styles",
 ]
 hiddenimports += collect_submodules("matplotlib.backends")
+
+# Build scripts set these so icon/version changes invalidate macOS icon caches.
+# Fallback keeps `pyinstaller flyswatter_gui.spec` working without the wrapper.
+icon_file = os.environ.get("FLYSWATTER_ICON", "assets/flyswatter_icon-new.png")
+app_version = os.environ.get("FLYSWATTER_VERSION", "0.1.0")
+app_build = os.environ.get("FLYSWATTER_BUILD", app_version)
 
 
 a = Analysis(
@@ -56,6 +64,10 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="FlySWATTER.app",
-    icon="assets/flyswatter_icon-new.png",
+    icon=icon_file,
     bundle_identifier="edu.umich.rallada.flyswatter",
+    info_plist={
+        "CFBundleShortVersionString": app_version,
+        "CFBundleVersion": app_build,
+    },
 )
