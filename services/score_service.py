@@ -889,8 +889,8 @@ def _format_sleep_xaxis(ax, use_wc_sleep: bool):
 
 
 def _apply_wall_clock_xaxis(ax) -> None:
-    # Always label every 30 minutes so short and partial runs still have readable ticks.
-    ax.xaxis.set_major_locator(mdates.MinuteLocator(byminute=[0, 30]))
+    # Scale tick spacing to the plotted duration so multi-day runs stay readable.
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
 
     def _major_fmt(value, _pos):
         dt_val = mdates.num2date(value)
