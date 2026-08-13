@@ -79,4 +79,19 @@ def _is_writable_directory(path: Path) -> bool:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:
         return False
-    return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    if not path.is_dir() or not os.access(path, os.W_OK | os.X_OK):
+        return False
+    # os.access only reports POSIX bits. macOS privacy controls deny access to
+    # locations like Desktop or Documents at open() time instead, so an actual
+    # write is the only reliable probe for a bundled app.
+    probe = path / f".flyswatter-write-test-{os.getpid()}"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+    except OSError:
+        return False
+    finally:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+    return True

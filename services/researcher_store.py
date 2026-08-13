@@ -13,11 +13,12 @@ def get_researcher_store_path(data_root: Path) -> Path:
 
 def load_researcher_names(data_root: Path) -> List[str]:
     store_path = get_researcher_store_path(data_root)
-    if not store_path.exists():
-        return []
     try:
+        if not store_path.exists():
+            return []
         payload = json.loads(store_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, OSError):
+        # A missing or unreadable name list must never stop the app from opening.
         return []
     names = payload.get("researchers", [])
     if not isinstance(names, list):

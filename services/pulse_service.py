@@ -10,28 +10,28 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import matplotlib.dates as mdates
 import numpy as np
 import pandas as pd
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from ConvertAcclLogsToPlots import (
-    calculate_adaptive_threshold,
     calculate_median_centered_offsets,
-    calculate_net_force,
-    count_peaks_above_threshold,
     find_manifest_path,
-    find_pulses_improved,
     load_manifest,
     parse_manifest_start_iso,
+    quantify_scheduled_pulses,
     smooth_signal,
 )
-from services.models import FolderWindowSummary, PulseAnalysisResult
+from services.models import FolderWindowSummary, PulseAnalysisResult, PulseWindow
 from services.output_packaging import create_zip_from_paths
+from services.plot_axes import apply_wall_clock_xaxis
 from services.power_management import prevent_sleep
 
 ProgressCallback = Optional[Callable[[int, str], None]]
+
+# Must cover the detector's background context window on either side.
+_CONTEXT_PADDING_MINUTES = 25
 
 
 def _has_csv_suffix(path: Path) -> bool:
@@ -239,15 +239,45 @@ def estimate_window_file_count(
     )
 
 
+def normalize_pulse_windows(raw_windows) -> List[PulseWindow]:
+    windows: List[PulseWindow] = []
+    for item in raw_windows or []:
+        if isinstance(item, PulseWindow):
+            start_iso, end_iso = item.start_iso, item.end_iso
+        elif isinstance(item, dict):
+            start_iso = item.get("start_iso")
+            end_iso = item.get("end_iso")
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            start_iso, end_iso = item
+        else:
+            continue
+        start_ts = pd.to_datetime(start_iso, errors="coerce")
+        end_ts = pd.to_datetime(end_iso, errors="coerce")
+        if pd.isna(start_ts) or pd.isna(end_ts):
+            continue
+        start_ts = _to_naive_ts(start_ts)
+        end_ts = _to_naive_ts(end_ts)
+        if end_ts <= start_ts:
+            continue
+        windows.append(
+            PulseWindow(
+                start_iso=start_ts.to_pydatetime().isoformat(),
+                end_iso=end_ts.to_pydatetime().isoformat(),
+            )
+        )
+    windows.sort(key=lambda window: window.start_iso)
+    return windows
+
+
 def run_pulse_analysis(
     folder_path: str | Path,
     output_dir: str | Path,
     *,
     window_start_iso: Optional[str] = None,
     window_end_iso: Optional[str] = None,
+    pulse_windows=None,
     n_max: int = 10,
     n_mins_bucket: int = 5,
-    min_pulse_gs: float = 0.0000005,
     threshold: Optional[float] = None,
     progress_callback: ProgressCallback = None,
 ) -> PulseAnalysisResult:
@@ -262,6 +292,10 @@ def run_pulse_analysis(
     if not csv_files:
         raise ValueError("No accelerometer log files were found in the selected folder.")
 
+    scheduled_windows = normalize_pulse_windows(pulse_windows)
+    if not scheduled_windows:
+        raise ValueError("At least one expected pulse window is required.")
+
     window_start = _to_naive_ts(pd.to_datetime(window_start_iso)) if window_start_iso else None
     window_end = _to_naive_ts(pd.to_datetime(window_end_iso)) if window_end_iso else None
     candidate_files = _select_candidate_files(
@@ -272,29 +306,29 @@ def run_pulse_analysis(
         window_start=window_start,
         window_end=window_end,
     )
-    padded_start = window_start - pd.Timedelta(minutes=10) if window_start is not None else None
-    padded_end = window_end + pd.Timedelta(minutes=10) if window_end is not None else None
+    # Read beyond the requested range so each window keeps its pre-window
+    # baseline and its surrounding background comparison. The padding is for
+    # analysis only and is trimmed back out before plotting.
+    padding = pd.Timedelta(minutes=_CONTEXT_PADDING_MINUTES)
+    padded_start = window_start - padding if window_start is not None else None
+    padded_end = window_end + padding if window_end is not None else None
     if not candidate_files:
         raise ValueError("No log files overlapped the selected time window.")
 
     all_frames = []
-    all_pulse_rows = []
     processed_files = []
     started_at = time.monotonic()
 
     with prevent_sleep():
         for index, file_path in enumerate(candidate_files, start=1):
-            frame, pulse_rows = _analyze_single_file(
+            frame = _prepare_file_frame(
                 file_path,
                 manifest_start_ts=manifest_start_ts,
                 window_start=padded_start,
                 window_end=padded_end,
-                threshold=threshold,
-                min_pulse_gs=min_pulse_gs,
             )
             if frame is not None and not frame.empty:
                 all_frames.append(frame)
-            all_pulse_rows.extend(pulse_rows)
             processed_files.append(file_path)
             elapsed = max(time.monotonic() - started_at, 0.001)
             avg_per_file = elapsed / index
@@ -307,22 +341,38 @@ def run_pulse_analysis(
                 f"Processed {index}/{len(candidate_files)} log files. Rough ETA: {eta_seconds}s",
             )
 
-        _emit(progress_callback, 90, "Rendering aggregated pulse metrics plot...")
+        _emit(progress_callback, 88, "Quantifying scheduled pulse windows...")
         combined_frame = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
-        aggregated_plot = output_path / f"Pulse_Metrics_Aggregated_{folder.name.replace(' ', '_')}.png"
-        _plot_aggregated_frame(
+        pulse_rows = quantify_scheduled_pulses(
             combined_frame,
+            scheduled_windows,
+            manual_threshold=threshold,
+        )
+        speed_setting = str(manifest.get("speed", "unknown"))
+        for row in pulse_rows:
+            row["SpeedSetting"] = speed_setting
+
+        _emit(progress_callback, 92, "Rendering aggregated pulse metrics plot...")
+        aggregated_plot = output_path / f"Pulse_Metrics_Aggregated_{folder.name.replace(' ', '_')}.png"
+        plot_frame = combined_frame
+        if not plot_frame.empty:
+            if window_start is not None:
+                plot_frame = plot_frame[plot_frame["AbsoluteTime"] >= window_start]
+            if window_end is not None:
+                plot_frame = plot_frame[plot_frame["AbsoluteTime"] <= window_end]
+        _plot_aggregated_frame(
+            plot_frame,
             aggregated_plot,
+            pulse_rows=pulse_rows,
             n_max=n_max,
             n_mins_bucket=n_mins_bucket,
-            threshold=threshold,
-            speed_setting=str(manifest.get("speed", "unknown")),
+            speed_setting=speed_setting,
             earliest_start_ts=_to_naive_ts(manifest_start_ts),
         )
 
         _emit(progress_callback, 96, "Writing aggregated pulse metrics workbook...")
         workbook_path = output_path / f"Pulse_Metrics_Aggregated_{folder.name.replace(' ', '_')}.xlsx"
-        pulse_df = _build_pulse_metrics_df(all_pulse_rows)
+        pulse_df = _build_pulse_metrics_df(pulse_rows)
         with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
             pulse_df.to_excel(writer, index=False, sheet_name="Pulses")
 
@@ -340,7 +390,7 @@ def run_pulse_analysis(
         zip_path=zip_path,
         processed_files=processed_files,
         analyzed_window_label=window_label,
-        total_pulses=len([row for row in all_pulse_rows if str(row.get("Order", "")).startswith("Pulse")]),
+        total_pulses=len([row for row in pulse_rows if row.get("Detection Status") == "detected"]),
     )
 
 
@@ -359,14 +409,12 @@ def _file_window_bounds(file_path: Path, manifest_start_ts: pd.Timestamp):
     return start, end
 
 
-def _analyze_single_file(
+def _prepare_file_frame(
     file_path: Path,
     *,
     manifest_start_ts: pd.Timestamp,
     window_start: Optional[pd.Timestamp],
     window_end: Optional[pd.Timestamp],
-    threshold: Optional[float],
-    min_pulse_gs: float,
 ):
     data = pd.read_csv(file_path)
     if "t_ms" not in data.columns:
@@ -383,7 +431,7 @@ def _analyze_single_file(
     if window_end is not None:
         data = data[data["AbsoluteTime"] <= window_end]
     if data.empty:
-        return None, []
+        return None
 
     x_offset, y_offset, z_offset = calculate_median_centered_offsets(str(file_path))
     v_ref = 3.0
@@ -405,7 +453,7 @@ def _analyze_single_file(
         + data["Smoothed_Z_Accel"] ** 2
     )
 
-    plot_data = pd.DataFrame(
+    return pd.DataFrame(
         {
             "AbsoluteTime": data["AbsoluteTime"],
             "Time": data["ElapsedSeconds"],
@@ -417,55 +465,14 @@ def _analyze_single_file(
         }
     )
 
-    data_for_pulses = plot_data.copy()
-    pulses = find_pulses_improved(
-        data_for_pulses,
-        adaptive_threshold=True,
-        smoothing=True,
-        min_pulse_duration=0.1,
-        min_gap_for_pulse=10.0,
-        manual_threshold=threshold,
-        extend_pulse_window=0.5,
-    )
-    actual_threshold = threshold if threshold is not None else calculate_adaptive_threshold(plot_data["Vibration_Accel"].values, window_size=30, noise_factor=4.0)
-    pulse_rows = []
-    for idx, (pulse_start, pulse_end) in enumerate(pulses, start=1):
-        net_force = calculate_net_force(plot_data, pulse_start, pulse_end)
-        if net_force < min_pulse_gs:
-            continue
-        mask = (plot_data["Time"] >= pulse_start) & (plot_data["Time"] <= pulse_end)
-        vals = plot_data.loc[mask, "Vibration_Accel"].values
-        n_vibs = count_peaks_above_threshold(vals, actual_threshold) if len(vals) >= 3 else 0
-        peak_g = float(np.max(vals)) if len(vals) > 0 else 0.0
-        start_ts = plot_data.loc[mask, "AbsoluteTime"].iloc[0] if mask.any() else plot_data["AbsoluteTime"].iloc[0]
-        end_ts = plot_data.loc[mask, "AbsoluteTime"].iloc[-1] if mask.any() else plot_data["AbsoluteTime"].iloc[-1]
-        pulse_rows.append(
-            {
-                "Order": f"Pulse {len(pulse_rows) + 1}",
-                "PulseIndex": len(pulse_rows) + 1,
-                "Pulse Start (s)": float(pulse_start),
-                "Pulse End (s)": float(pulse_end),
-                "Duration (s)": float(max(pulse_end - pulse_start, 0.0)),
-                "Net Force (g·s)": float(net_force),
-                "Peak Force (g)": float(peak_g),
-                "# peaks": int(n_vibs),
-                "Frequency (Hz)": (float(n_vibs) / float(max(pulse_end - pulse_start, 1e-6))),
-                "SpeedSetting": str(file_path.parent.parent.name if file_path.parent != file_path.parent.parent else file_path.parent.name),
-                "SourceFile": file_path.name,
-                "Pulse Start ts": pd.to_datetime(start_ts).isoformat(),
-                "Pulse End ts": pd.to_datetime(end_ts).isoformat(),
-            }
-        )
-    return plot_data, pulse_rows
-
 
 def _plot_aggregated_frame(
     combined_frame: pd.DataFrame,
     output_path: Path,
     *,
+    pulse_rows: List[Dict[str, object]],
     n_max: int,
     n_mins_bucket: int,
-    threshold: Optional[float],
     speed_setting: str,
     earliest_start_ts: Optional[pd.Timestamp],
 ) -> None:
@@ -504,52 +511,73 @@ def _plot_aggregated_frame(
         for _, row in chosen_points.iterrows():
             ax.text(row["AbsoluteTime"], row["Vibration_Accel"], f"{row['Vibration_Accel']:.2f}", va="bottom", ha="center", fontsize=8)
 
-    data_for_pulses = combined_frame.copy()
-    data_for_pulses["Time"] = elapsed_from_start
-    pulses = find_pulses_improved(
-        data_for_pulses,
-        adaptive_threshold=True,
-        smoothing=True,
-        min_pulse_duration=0.1,
-        min_gap_for_pulse=10.0,
-        manual_threshold=threshold,
-        extend_pulse_window=0.5,
-    )
-    qualified_pulses = []
-    for start, end in pulses:
-        net_force = calculate_net_force(data_for_pulses, start, end)
-        if net_force >= 0.0000005:
-            qualified_pulses.append((start, end))
-    for idx, (pulse_start, pulse_end) in enumerate(qualified_pulses, start=1):
-        x_start = combined_frame["AbsoluteTime"].iloc[0] + pd.to_timedelta(pulse_start, unit="s")
-        x_end = combined_frame["AbsoluteTime"].iloc[0] + pd.to_timedelta(pulse_end, unit="s")
-        ax.axvspan(x_start, x_end, color="grey", alpha=0.15, label="Stimulus Window" if idx == 1 else None)
-        ax.axvline(x=x_start, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
-        ax.axvline(x=x_end, color="grey", linestyle="--", linewidth=0.8, alpha=0.5)
-        pulse_window = (elapsed_from_start >= pulse_start) & (elapsed_from_start <= pulse_end)
+    expected_labeled = False
+    detected_labeled = False
+    suspect_labeled = False
+    for row in pulse_rows:
+        expected_start = row.get("expected_start")
+        expected_end = row.get("expected_end")
+        if expected_start is not None and expected_end is not None:
+            ax.axvspan(
+                expected_start,
+                expected_end,
+                color="#4f8cff",
+                alpha=0.10,
+                label="Expected Window" if not expected_labeled else None,
+            )
+            expected_labeled = True
+        pulse_start = row.get("pulse_start")
+        pulse_end = row.get("pulse_end")
+        background_check = str(row.get("Background Check") or "")
+        stands_out = background_check in {"distinct", "marginal", "no comparison"}
+        if row.get("detected") and pulse_start is not None and pulse_end is not None:
+            span_color = "grey" if stands_out else "#d98c00"
+            if stands_out:
+                span_label = "Detected Pulse" if not detected_labeled else None
+                detected_labeled = True
+            else:
+                span_label = "Matches Background" if not suspect_labeled else None
+                suspect_labeled = True
+            ax.axvspan(pulse_start, pulse_end, color=span_color, alpha=0.18, label=span_label)
+            ax.axvline(x=pulse_start, color=span_color, linestyle="--", linewidth=0.8, alpha=0.5)
+            ax.axvline(x=pulse_end, color=span_color, linestyle="--", linewidth=0.8, alpha=0.5)
+            label_x = pulse_start + (pulse_end - pulse_start) / 2
+            pulse_window = (combined_frame["AbsoluteTime"] >= pulse_start) & (combined_frame["AbsoluteTime"] <= pulse_end)
+        else:
+            label_x = expected_start + (expected_end - expected_start) / 2 if expected_start is not None and expected_end is not None else combined_frame["AbsoluteTime"].iloc[0]
+            pulse_window = (
+                (combined_frame["AbsoluteTime"] >= expected_start) & (combined_frame["AbsoluteTime"] <= expected_end)
+                if expected_start is not None and expected_end is not None
+                else pd.Series(False, index=combined_frame.index)
+            )
         local_max = float(combined_frame.loc[pulse_window, "Vibration_Accel"].max()) if pulse_window.any() else float(combined_frame["Vibration_Accel"].max())
         y_low, y_high = ax.get_ylim()
         y_gap = max(y_high - y_low, 1e-6)
         label_y = local_max + (0.08 * y_gap)
         if label_y > y_high * 0.995:
             ax.set_ylim(y_low, label_y + (0.08 * y_gap))
+        pulse_index = int(row.get("PulseIndex") or 0)
+        if not row.get("detected"):
+            label = f"P{pulse_index} (n.d.)"
+        elif background_check == "matches background":
+            label = f"P{pulse_index} (bg)"
+        elif background_check == "marginal":
+            label = f"P{pulse_index} (marginal)"
+        else:
+            label = f"P{pulse_index}"
         ax.text(
-            x_start + (x_end - x_start) / 2,
+            label_x,
             label_y,
-            f"P{idx}",
+            label,
             ha="center",
             va="bottom",
-            fontsize=6,
+            fontsize=7,
             color="black",
             backgroundcolor="white",
             alpha=0.8,
         )
 
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    try:
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%-I:%M%p"))
-    except Exception:
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%I:%M%p"))
+    apply_wall_clock_xaxis(ax)
     ax.set_xlabel("Local Time")
     ax.set_ylabel("Acceleration (g)")
     date_label = None
@@ -579,7 +607,9 @@ def _plot_aggregated_frame(
             "X Accel",
             "Y Accel",
             "Z Accel (adj. for gravity)",
-            "Stimulus Window",
+            "Expected Window",
+            "Detected Pulse",
+            "Matches Background",
         ]
         ordered_pairs = sorted(
             zip(labels, handles),
@@ -588,66 +618,85 @@ def _plot_aggregated_frame(
         ordered_labels, ordered_handles = zip(*ordered_pairs)
         ax.legend(ordered_handles, ordered_labels, loc="lower left", fontsize="x-small", ncol=1, frameon=True)
     fig.tight_layout()
-    ax.grid(True, linestyle="--", alpha=0.5)
+    ax.grid(True, axis="x", which="major", linestyle="--", alpha=0.45)
+    ax.grid(True, axis="x", which="minor", linestyle="--", alpha=0.2)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.5)
     fig.savefig(output_path, dpi=300)
+
+
+_PULSE_EXPORT_COLUMNS = [
+    "Order",
+    "PulseIndex",
+    "Detection Status",
+    "Background Check",
+    "Expected Start ts",
+    "Expected End ts",
+    "Pulse Start ts",
+    "Pulse End ts",
+    "Pulse Start (s from window)",
+    "Pulse End (s from window)",
+    "Duration (s)",
+    "Baseline (g)",
+    "Threshold (g)",
+    "Baseline-Adjusted Area (g·s)",
+    "Peak Force (g)",
+    "Background Peak p99 (g)",
+    "Background Peak Max (g)",
+    "Background Peak Count",
+    "Peak / Background p99",
+    "# peaks",
+    "Frequency (Hz)",
+    "SpeedSetting",
+    "SourceFile",
+]
+
+_PULSE_TEXT_COLUMNS = {
+    "Order",
+    "Detection Status",
+    "Background Check",
+    "SpeedSetting",
+    "SourceFile",
+    "Expected Start ts",
+    "Expected End ts",
+    "Pulse Start ts",
+    "Pulse End ts",
+}
 
 
 def _build_pulse_metrics_df(pulse_rows: List[Dict[str, object]]) -> pd.DataFrame:
     if pulse_rows:
         out_df = pd.DataFrame(pulse_rows)
     else:
-        out_df = pd.DataFrame(
-            columns=[
-                "Order",
-                "PulseIndex",
-                "Pulse Start (s)",
-                "Pulse End (s)",
-                "Duration (s)",
-                "Net Force (g·s)",
-                "Peak Force (g)",
-                "# peaks",
-                "Frequency (Hz)",
-                "SpeedSetting",
-                "SourceFile",
-                "Pulse Start ts",
-                "Pulse End ts",
-            ]
-        )
-    for column in ["Duration (s)", "Net Force (g·s)", "Peak Force (g)", "# peaks"]:
-        if column in out_df.columns:
-            out_df[column] = pd.to_numeric(out_df[column], errors="coerce")
-    avg_row = {
-        "Order": "Avg",
-        "PulseIndex": np.nan,
-        "Pulse Start (s)": np.nan,
-        "Pulse End (s)": np.nan,
-        "Duration (s)": float(out_df["Duration (s)"].mean(skipna=True)) if "Duration (s)" in out_df else np.nan,
-        "Net Force (g·s)": float(out_df["Net Force (g·s)"].mean(skipna=True)) if "Net Force (g·s)" in out_df else np.nan,
-        "Peak Force (g)": float(out_df["Peak Force (g)"].mean(skipna=True)) if "Peak Force (g)" in out_df else np.nan,
-        "# peaks": float(out_df["# peaks"].mean(skipna=True)) if "# peaks" in out_df else np.nan,
-        "Frequency (Hz)": float(out_df["Frequency (Hz)"].mean(skipna=True)) if "Frequency (Hz)" in out_df else np.nan,
-        "SpeedSetting": "",
-        "SourceFile": "",
-    }
-    std_row = {
-        "Order": "Std dv",
-        "PulseIndex": np.nan,
-        "Pulse Start (s)": np.nan,
-        "Pulse End (s)": np.nan,
-        "Duration (s)": float(out_df["Duration (s)"].std(skipna=True, ddof=1)) if "Duration (s)" in out_df and out_df["Duration (s)"].count() > 1 else np.nan,
-        "Net Force (g·s)": float(out_df["Net Force (g·s)"].std(skipna=True, ddof=1)) if "Net Force (g·s)" in out_df and out_df["Net Force (g·s)"].count() > 1 else np.nan,
-        "Peak Force (g)": float(out_df["Peak Force (g)"].std(skipna=True, ddof=1)) if "Peak Force (g)" in out_df and out_df["Peak Force (g)"].count() > 1 else np.nan,
-        "# peaks": float(out_df["# peaks"].std(skipna=True, ddof=1)) if "# peaks" in out_df and out_df["# peaks"].count() > 1 else np.nan,
-        "Frequency (Hz)": float(out_df["Frequency (Hz)"].std(skipna=True, ddof=1)) if "Frequency (Hz)" in out_df and out_df["Frequency (Hz)"].count() > 1 else np.nan,
-        "SpeedSetting": "",
-        "SourceFile": "",
-    }
-    return pd.concat([out_df, pd.DataFrame([avg_row, std_row])], ignore_index=True)
+        out_df = pd.DataFrame(columns=_PULSE_EXPORT_COLUMNS)
+    export_df = out_df.reindex(columns=[column for column in _PULSE_EXPORT_COLUMNS if column in out_df.columns or column in _PULSE_EXPORT_COLUMNS])
+    for column in _PULSE_EXPORT_COLUMNS:
+        if column not in export_df.columns:
+            export_df[column] = np.nan
+    export_df = export_df[_PULSE_EXPORT_COLUMNS]
+    numeric_columns = [
+        "Duration (s)",
+        "Baseline (g)",
+        "Threshold (g)",
+        "Baseline-Adjusted Area (g·s)",
+        "Peak Force (g)",
+        "# peaks",
+        "Frequency (Hz)",
+    ]
+    for column in numeric_columns:
+        export_df[column] = pd.to_numeric(export_df[column], errors="coerce")
+    detected_df = export_df[export_df["Detection Status"] == "detected"] if "Detection Status" in export_df else export_df
+    avg_row = {column: "" if column in _PULSE_TEXT_COLUMNS else np.nan for column in _PULSE_EXPORT_COLUMNS}
+    avg_row["Order"] = "Avg"
+    std_row = dict(avg_row)
+    std_row["Order"] = "Std dv"
+    for column in numeric_columns:
+        avg_row[column] = float(detected_df[column].mean(skipna=True)) if column in detected_df and detected_df[column].notna().any() else np.nan
+        std_row[column] = float(detected_df[column].std(skipna=True, ddof=1)) if column in detected_df and detected_df[column].count() > 1 else np.nan
+    return pd.concat([export_df, pd.DataFrame([avg_row, std_row])], ignore_index=True)
 
 
 def _to_naive_ts(timestamp: pd.Timestamp) -> pd.Timestamp:
     ts = pd.Timestamp(timestamp)
-    try:
-        return ts.tz_localize(None)
-    except TypeError:
-        return ts
+    if ts.tz is not None:
+        return pd.Timestamp(ts.to_pydatetime().replace(tzinfo=None))
+    return ts

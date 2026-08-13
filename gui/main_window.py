@@ -138,7 +138,19 @@ class FlySwatterMainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.pulse_upload_screen)
 
     def _handle_score_file_selected(self, file_path: str) -> None:
-        validation = validate_score_file(file_path)
+        try:
+            validation = validate_score_file(file_path)
+        except OSError as exc:
+            self._show_error(
+                "Could not read the selected Zantiks file.",
+                [
+                    str(exc),
+                    "If the file is on a network drive, confirm it is still mounted.",
+                    "If macOS is blocking access, grant FlySWATTER permission under "
+                    "System Settings > Privacy & Security > Files and Folders.",
+                ],
+            )
+            return
         if not validation.valid:
             self._show_error(
                 validation.message,
@@ -207,7 +219,21 @@ class FlySwatterMainWindow(QMainWindow):
             self._copy_artifact(Path(key))
 
     def _handle_pulse_folder_selected(self, folder_path: str) -> None:
-        validation = validate_accel_folder(folder_path)
+        try:
+            validation = validate_accel_folder(folder_path)
+        except OSError as exc:
+            # Network shares and privacy-protected locations fail here, and an
+            # error escaping this slot would take the whole app down.
+            self._show_error(
+                "Could not read the selected accelerometer log folder.",
+                [
+                    str(exc),
+                    "If the data is on a network drive, confirm it is still mounted.",
+                    "If macOS is blocking access, grant FlySWATTER permission under "
+                    "System Settings > Privacy & Security > Files and Folders.",
+                ],
+            )
+            return
         if not validation.valid:
             self._show_error(
                 validation.message,
@@ -228,7 +254,13 @@ class FlySwatterMainWindow(QMainWindow):
     def _handle_folder_summary_ready(self, summary) -> None:
         self._current_worker = None
         self._pulse_folder_summary = summary
-        self.time_window_screen.set_summary(summary)
+        try:
+            self.time_window_screen.set_summary(summary)
+        except Exception as exc:
+            self.pulse_progress_screen.finish()
+            self._show_error("Could not prepare the time window screen.", [str(exc)])
+            self.stack.setCurrentWidget(self.pulse_upload_screen)
+            return
         self.stack.setCurrentWidget(self.time_window_screen)
 
     def _handle_folder_scan_error(self, message: str) -> None:
@@ -237,9 +269,12 @@ class FlySwatterMainWindow(QMainWindow):
         self._show_error("Failed to scan folder.", [message])
         self.stack.setCurrentWidget(self.pulse_upload_screen)
 
-    def _run_pulse_analysis(self, start_iso: str, end_iso: str) -> None:
+    def _run_pulse_analysis(self, start_iso: str, end_iso: str, pulse_windows=None) -> None:
         if self.state.selected_pulse_folder is None:
             self._show_error("Select an accelerometer log folder first.")
+            return
+        if not pulse_windows:
+            self._show_error("Add at least one expected pulse window before starting analysis.")
             return
         output_dir = build_run_output_dir(self.data_root, self.state.researcher_name)
         worker = FunctionWorker(
@@ -248,6 +283,7 @@ class FlySwatterMainWindow(QMainWindow):
             output_dir,
             window_start_iso=start_iso,
             window_end_iso=end_iso,
+            pulse_windows=pulse_windows,
         )
         worker.setAutoDelete(False)
         worker.signals.finished.connect(self._handle_pulse_finished, Qt.QueuedConnection)

@@ -32,6 +32,12 @@ class ScoreAnalysisResult:
 
 
 @dataclass
+class PulseWindow:
+    start_iso: str
+    end_iso: str
+
+
+@dataclass
 class PulseAnalysisResult:
     output_dir: Path
     aggregated_plot: Path

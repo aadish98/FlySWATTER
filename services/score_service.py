@@ -18,7 +18,7 @@ from matplotlib.artist import setp as _mpl_setp
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Patch
-from matplotlib.ticker import FuncFormatter, MultipleLocator
+from matplotlib.ticker import MultipleLocator
 
 from ScoreArousability import (
     _ensure_numeric,
@@ -31,6 +31,7 @@ from ScoreArousability import (
 )
 from services.models import ScoreAnalysisResult
 from services.output_packaging import create_zip_from_paths
+from services.plot_axes import apply_wall_clock_xaxis
 from services.power_management import prevent_sleep
 
 ProgressCallback = Optional[Callable[[int, str], None]]
@@ -889,18 +890,7 @@ def _format_sleep_xaxis(ax, use_wc_sleep: bool):
 
 
 def _apply_wall_clock_xaxis(ax) -> None:
-    # Scale tick spacing to the plotted duration so multi-day runs stay readable.
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=4, maxticks=10))
-
-    def _major_fmt(value, _pos):
-        dt_val = mdates.num2date(value)
-        if getattr(dt_val, "tzinfo", None) is not None:
-            dt_val = dt_val.replace(tzinfo=None)
-        return dt_val.strftime("%I:%M %p").lstrip("0")
-
-    ax.xaxis.set_major_formatter(FuncFormatter(_major_fmt))
-    _mpl_setp(ax.xaxis.get_majorticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    ax.tick_params(axis="x", which="major", length=8, width=1.2)
+    apply_wall_clock_xaxis(ax)
 
 
 def _to_is_light(value):
