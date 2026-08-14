@@ -91,7 +91,10 @@ export FLYSWATTER_VERSION="${APP_VERSION}"
 export FLYSWATTER_BUILD="${BUILD_ID}"
 
 echo "Clearing extended attributes that can break codesign..."
-xattr -cr "${PROJECT_DIR}"
+# .git is skipped: loose objects are read-only, so clearing attributes on them
+# fails, and nothing under .git is ever copied into the bundle anyway.
+find "${PROJECT_DIR}" -name .git -prune -o -print0 \
+  | xargs -0 xattr -c 2>/dev/null || true
 
 echo "Building FlySWATTER.app with local temporary paths..."
 "${BUILD_VENV}/bin/python" -m PyInstaller \

@@ -7,6 +7,7 @@ from pathlib import Path
 import ctypes
 import numpy as np
 import pandas as pd
+from scipy.ndimage import median_filter
 from scipy.signal import find_peaks
 
 try:
@@ -33,19 +34,23 @@ def calculate_median_centered_offsets(filepath, V_ref=3.0, sensitivity=0.3):
     Note: Z acceleration in plotting is computed as ((Z_V - Z_offset)/sensitivity) + 1.0.
     To center Z on 0 (not 1) after that +1 adjustment, set Z_offset = median(Z_V) + sensitivity.
     """
-    data = pd.read_csv(filepath)
-    
+    data = pd.read_csv(filepath, usecols=["X", "Y", "Z"])
+    return median_centered_offsets_from_frame(data, V_ref=V_ref, sensitivity=sensitivity)
+
+
+def median_centered_offsets_from_frame(data, V_ref=3.0, sensitivity=0.3):
+    """Offsets for an already-loaded frame, so callers need not re-read the file."""
     # Convert ADC values to voltage
-    data["X_Voltage"] = data["X"] * V_ref / 1023.0
-    data["Y_Voltage"] = data["Y"] * V_ref / 1023.0
-    data["Z_Voltage"] = data["Z"] * V_ref / 1023.0
-    
+    x_voltage = data["X"] * V_ref / 1023.0
+    y_voltage = data["Y"] * V_ref / 1023.0
+    z_voltage = data["Z"] * V_ref / 1023.0
+
     # Calculate offsets as the median voltage (this centers the median on 0)
-    X_offset = data["X_Voltage"].median()
-    Y_offset = data["Y_Voltage"].median()
+    X_offset = x_voltage.median()
+    Y_offset = y_voltage.median()
     # For Z, add +sensitivity to counter the +1g added in plotting so median -> 0
-    Z_offset = data["Z_Voltage"].median() + sensitivity
-    
+    Z_offset = z_voltage.median() + sensitivity
+
     return X_offset, Y_offset, Z_offset
 
 
@@ -127,86 +132,153 @@ def calc_logging_duration(filepath: str) -> float:
 # numpy 2.0 renamed trapz to trapezoid; keep both working.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 
+# Envelope amplitudes below this are treated as zero spread, which only happens
+# on synthetic constant signals.
+_MIN_SCALE_G = 1e-6
+# Granularity of the noise-floor tracker. One second is far longer than any
+# stimulus and far shorter than the drift it has to follow.
+_FLOOR_BLOCK_SECONDS = 1.0
 
-def calculate_baseline_adjusted_area(time_s, signal, baseline: float) -> float:
-    """Integrate excess acceleration above a local baseline, in g·s."""
-    if time_s is None or signal is None:
-        return 0.0
+
+def rms_envelope(signal, times_ns, window_s: float = 0.025) -> np.ndarray:
+    """Centred RMS amplitude of `signal` over a `window_s` stretch of tape.
+
+    A vibration stimulus is an oscillation: the trace swings back through its
+    own baseline every few milliseconds, so no level threshold applied to the
+    raw trace can say where a burst begins or ends. Its runs above any
+    threshold are single cycles a few milliseconds long. The RMS envelope
+    collapses that oscillation into the amplitude curve the eye follows on the
+    plot, and every decision below is made on that curve instead.
+
+    The window is measured in time rather than in samples. The logger stamps
+    whole milliseconds while sampling faster than 1 kHz, so any sample-rate
+    estimate lands on one of two neighbouring values depending on how much data
+    was handed in, and a window counted in samples would quietly change width
+    with the size of the frame.
+    """
+    values = np.asarray(signal, dtype=float)
+    stamps = np.asarray(times_ns, dtype=np.int64)
+    if values.size < 2:
+        return np.abs(values)
+    half = max(int(window_s * 1e9) // 2, 1)
+    low = np.searchsorted(stamps, stamps - half, side="left")
+    high = np.searchsorted(stamps, stamps + half, side="right")
+    cumulative = np.concatenate(([0.0], np.cumsum(np.square(values))))
+    return np.sqrt((cumulative[high] - cumulative[low]) / (high - low))
+
+
+def _sampling_interval(time_s) -> float:
+    """Seconds per sample, tolerant of the logger's tied millisecond stamps."""
+    arr = np.asarray(time_s, dtype=float)
+    if arr.size < 2:
+        return 0.001
+    diffs = np.diff(arr)
+    positive = diffs[diffs > 0]
+    if positive.size == 0:
+        return 0.001
+    return float(np.median(positive))
+
+
+def _block_starts(times_ns, block_seconds: float = _FLOOR_BLOCK_SECONDS) -> np.ndarray:
+    """Offsets where each whole-clock-second block of samples begins.
+
+    Blocks are cut on the recording's own clock rather than by sample count, so
+    a given second of tape always falls in the same block however much of the
+    run was handed in.
+    """
+    stamps = np.asarray(times_ns, dtype=np.int64)
+    if stamps.size == 0:
+        return np.empty(0, dtype=np.int64)
+    block_id = stamps // max(int(block_seconds * 1e9), 1)
+    return np.flatnonzero(np.concatenate(([True], block_id[1:] != block_id[:-1])))
+
+
+def estimate_noise_floor(envelope, times_ns, floor_window_s: float = 120.0):
+    """Track the slowly drifting noise floor of an envelope, and its spread.
+
+    Ambient vibration changes over a multi-day recording as incubators cycle
+    and people move around the room, and an expected window can be an hour
+    wide, so a single baseline measured just before the window describes the
+    wrong stretch of recording. A rolling median follows the drift, and a
+    stimulus never moves it because a burst lasts seconds out of the minutes
+    each median is taken over.
+
+    Blocks are cut on the recording's own clock rather than by sample count, so
+    a given second of tape always forms the same block. That is what lets one
+    window quantified on its own agree with the same window quantified inside
+    the whole run.
+
+    Returns per-sample (floor, scale) arrays, where scale is a robust standard
+    deviation derived from the interquartile range.
+    """
+    values = np.asarray(envelope, dtype=float)
+    size = values.size
+    if size == 0:
+        return values.copy(), values.copy()
+    starts = _block_starts(times_ns)
+    ends = np.append(starts[1:], size)
+    blocks = starts.size
+    if blocks < 3:
+        low, mid_value, high = np.percentile(values, [25, 50, 75])
+        floor = np.full(size, float(mid_value))
+        scale = np.full(size, max(float(high - low) / 1.349, _MIN_SCALE_G))
+        return floor, scale
+
+    quartiles = np.empty((blocks, 3), dtype=float)
+    for position in range(blocks):
+        quartiles[position] = np.percentile(
+            values[starts[position] : ends[position]], (25, 50, 75)
+        )
+    mid = quartiles[:, 1]
+    spread = (quartiles[:, 2] - quartiles[:, 0]) / 1.349
+    span = max(int(round(floor_window_s / _FLOOR_BLOCK_SECONDS)) | 1, 3)
+    if span < blocks:
+        mid = median_filter(mid, size=span, mode="nearest")
+        spread = median_filter(spread, size=span, mode="nearest")
+    else:
+        mid = np.full(blocks, float(np.median(mid)))
+        spread = np.full(blocks, float(np.median(spread)))
+    index = np.repeat(np.arange(blocks), ends - starts)
+    return mid[index], np.maximum(spread, _MIN_SCALE_G)[index]
+
+
+def find_burst_bounds(time_s, envelope, anchor: int, edge_level: float, bridge_gap_s: float):
+    """Sample bounds of the burst containing `anchor`.
+
+    Stretches separated by less than `bridge_gap_s` are one burst, since a
+    motor ramp dips without stopping. That gap is deliberately short: bridging
+    whole seconds chains a real stimulus to unrelated knocks either side of it,
+    which is how a 300 ms pulse ends up reported as minutes long.
+    """
+    above = np.asarray(envelope, dtype=float) >= float(edge_level)
+    anchor = int(anchor)
+    if not above[anchor]:
+        return anchor, anchor
+    padded = np.concatenate(([False], above, [False]))
+    delta = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(delta == 1)
+    ends = np.flatnonzero(delta == -1) - 1
     time_arr = np.asarray(time_s, dtype=float)
-    signal_arr = np.asarray(signal, dtype=float)
-    if time_arr.size < 2 or signal_arr.size < 2:
-        return 0.0
-    excess = np.clip(signal_arr - float(baseline), 0.0, None)
-    return float(_trapezoid(excess, time_arr))
+    if starts.size > 1:
+        gaps = time_arr[starts[1:]] - time_arr[ends[:-1]]
+        group = np.concatenate(([0], np.cumsum(gaps > float(bridge_gap_s))))
+    else:
+        group = np.zeros(1, dtype=np.int64)
+    which = int(np.searchsorted(starts, anchor, side="right")) - 1
+    members = np.flatnonzero(group == group[which])
+    return int(starts[members[0]]), int(ends[members[-1]])
 
 
-def count_prominent_peaks(signal, time_s, prominence: float, min_distance_s: float = 0.05) -> int:
+def count_prominent_peaks(signal, time_s, prominence: float, min_distance_s: float = 0.002) -> int:
     """Count local maxima with explicit prominence and temporal separation."""
     signal_arr = np.asarray(signal, dtype=float)
     time_arr = np.asarray(time_s, dtype=float)
     if signal_arr.size < 3 or time_arr.size < 3:
         return 0
-    dt = float(np.median(np.diff(time_arr))) if time_arr.size > 1 else 0.001
+    dt = _sampling_interval(time_arr)
     distance = max(int(round(min_distance_s / max(dt, 1e-6))), 1)
     peaks, _ = find_peaks(signal_arr, prominence=max(float(prominence), 0.0), distance=distance)
     return int(len(peaks))
-
-
-def _robust_center_and_mad(values) -> tuple[float, float]:
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return 0.0, 0.002
-    median_val = float(np.median(arr))
-    mad = float(np.median(np.abs(arr - median_val)))
-    if mad < 1e-6:
-        mad = 0.002
-    keep = np.abs(arr - median_val) <= (6.0 * mad)
-    if int(keep.sum()) >= 50 and int(keep.sum()) < arr.size:
-        trimmed = arr[keep]
-        median_val = float(np.median(trimmed))
-        mad = float(np.median(np.abs(trimmed - median_val)))
-        if mad < 1e-6:
-            mad = 0.002
-    return median_val, mad
-
-
-def estimate_local_baseline(
-    abs_time,
-    signal,
-    window_start,
-    window_end,
-    baseline_seconds: float = 60.0,
-    exclude_spans=None,
-    restrict_mask=None,
-):
-    """Estimate quiet baseline immediately before a scheduled window.
-
-    Any other expected pulse windows are excluded so a neighbouring stimulus
-    cannot inflate the baseline used here. `restrict_mask` keeps the estimate
-    within one log file, since each file is offset-corrected independently and
-    its noise floor shifts at the boundary.
-    """
-    abs_index = pd.to_datetime(pd.Series(abs_time))
-    signal_arr = np.asarray(signal, dtype=float)
-    window_start_ts = pd.Timestamp(window_start)
-    window_end_ts = pd.Timestamp(window_end)
-    pre_start = window_start_ts - pd.Timedelta(seconds=baseline_seconds)
-    pre_mask = (abs_index >= pre_start) & (abs_index < window_start_ts)
-    pre_mask = _apply_exclusions(pre_mask, abs_index, exclude_spans, keep_span=(window_start_ts, window_end_ts))
-    if restrict_mask is not None:
-        pre_mask = pre_mask & pd.Series(np.asarray(restrict_mask, dtype=bool), index=pre_mask.index)
-    pre_vals = signal_arr[pre_mask.to_numpy()]
-    if pre_vals.size >= 50:
-        return _robust_center_and_mad(pre_vals)
-    win_mask = (abs_index >= window_start_ts) & (abs_index <= window_end_ts)
-    win_vals = signal_arr[win_mask.to_numpy()]
-    if win_vals.size == 0:
-        return 0.0, 0.002
-    cutoff = np.percentile(win_vals, 40)
-    quiet = win_vals[win_vals <= cutoff]
-    if quiet.size < 10:
-        quiet = win_vals
-    return _robust_center_and_mad(quiet)
 
 
 def _apply_exclusions(mask, abs_index, exclude_spans, keep_span=None):
@@ -220,143 +292,63 @@ def _apply_exclusions(mask, abs_index, exclude_spans, keep_span=None):
     return mask
 
 
-def summarize_background_peaks(
+def summarize_background_bursts(
     abs_time,
-    signal,
+    excess,
     window_start,
     window_end,
     *,
     exclude_spans=None,
-    restrict_mask=None,
+    burst_span=None,
+    guard_seconds: float = 5.0,
     context_minutes: float = 20.0,
-    min_height: float = 0.0,
-    min_separation_s: float = 5.0,
+    level: float = 0.0,
 ):
-    """Describe peak amplitudes surrounding a window, ignoring expected windows.
+    """How often the recording around a burst produces a burst of its own.
 
-    Returns (count, p99, max). This is what tells us whether an in-window peak
-    is actually a stimulus or just the largest sample of an ongoing periodic
-    background, which a window-local threshold alone cannot distinguish.
+    Returns (count, p99, max) over per-block maxima of the envelope excess in
+    the recording either side of the window, plus the rest of the window itself
+    once the candidate burst and a guard around it are removed. Everything but
+    the candidate counts as background, because a stimulus has to stand out
+    from the stretch of recording it sits in, and a noisy quarter of an hour is
+    usually noisy for the whole window rather than politely stopping at its
+    edge. Other scheduled windows are dropped so a neighbouring stimulus is
+    never mistaken for background. `count` is the number of blocks that would
+    themselves have cleared this pulse's detection level.
     """
     abs_index = pd.to_datetime(pd.Series(abs_time))
-    signal_arr = np.asarray(signal, dtype=float)
+    excess_arr = np.asarray(excess, dtype=float)
     window_start_ts = pd.Timestamp(window_start)
     window_end_ts = pd.Timestamp(window_end)
     context = pd.Timedelta(minutes=context_minutes)
     ctx_mask = (abs_index >= window_start_ts - context) & (abs_index <= window_end_ts + context)
-    ctx_mask = ctx_mask & ~((abs_index >= window_start_ts) & (abs_index <= window_end_ts))
-    ctx_mask = _apply_exclusions(ctx_mask, abs_index, exclude_spans)
-    if restrict_mask is not None:
-        same_file = ctx_mask & pd.Series(np.asarray(restrict_mask, dtype=bool), index=ctx_mask.index)
-        if int(same_file.sum()) >= 100:
-            ctx_mask = same_file
-    ctx_vals = signal_arr[ctx_mask.to_numpy()]
-    if ctx_vals.size < 100:
+    if burst_span is None:
+        ctx_mask = ctx_mask & ~((abs_index >= window_start_ts) & (abs_index <= window_end_ts))
+    else:
+        guard = pd.Timedelta(seconds=guard_seconds)
+        ctx_mask = ctx_mask & ~(
+            (abs_index >= pd.Timestamp(burst_span[0]) - guard)
+            & (abs_index <= pd.Timestamp(burst_span[1]) + guard)
+        )
+    ctx_mask = _apply_exclusions(
+        ctx_mask, abs_index, exclude_spans, keep_span=(window_start_ts, window_end_ts)
+    )
+    keep = ctx_mask.to_numpy()
+    ctx_vals = excess_arr[keep]
+    starts = _block_starts(abs_index.to_numpy().astype("int64")[keep])
+    if starts.size < 3:
         return 0, float("nan"), float("nan")
-    ctx_times = abs_index[ctx_mask]
-    elapsed = (ctx_times - ctx_times.iloc[0]).dt.total_seconds().to_numpy(dtype=float)
-    dt = float(np.median(np.diff(elapsed))) if elapsed.size > 1 else 0.001
-    distance = max(int(round(min_separation_s / max(dt, 1e-6))), 1)
-    peaks, props = find_peaks(ctx_vals, height=max(min_height, 0.0), distance=distance)
-    if peaks.size == 0:
-        return 0, float("nan"), float("nan")
-    heights = np.asarray(props["peak_heights"], dtype=float)
-    return int(heights.size), float(np.percentile(heights, 99)), float(np.max(heights))
+    block_max = np.maximum.reduceat(ctx_vals, starts)
+    return (
+        int(np.count_nonzero(block_max >= float(level))),
+        float(np.percentile(block_max, 99)),
+        float(np.max(block_max)),
+    )
 
 
-def _threshold_runs(time_s, signal, threshold: float):
-    time_arr = np.asarray(time_s, dtype=float)
-    signal_arr = np.asarray(signal, dtype=float)
-    above = signal_arr >= float(threshold)
-    if not above.any():
-        return []
-    padded = np.concatenate([[False], above, [False]])
-    delta = np.diff(padded.astype(int))
-    starts = np.where(delta == 1)[0]
-    ends = np.where(delta == -1)[0] - 1
-    return [(float(time_arr[start]), float(time_arr[end])) for start, end in zip(starts, ends)]
-
-
-def _expand_run_edges(time_s, signal, start_idx: int, end_idx: int, expand_thr: float, max_extend_s: float = 3.0, quiet_s: float = 0.08):
-    """Extend a detected run slightly to capture the oscillatory tail."""
-    time_arr = np.asarray(time_s, dtype=float)
-    signal_arr = np.asarray(signal, dtype=float)
-    last_above = int(start_idx)
-    for idx in range(int(start_idx) - 1, -1, -1):
-        if time_arr[start_idx] - time_arr[idx] > max_extend_s:
-            break
-        if signal_arr[idx] >= expand_thr:
-            last_above = idx
-        elif time_arr[last_above] - time_arr[idx] >= quiet_s:
-            break
-    start_idx = last_above
-    last_above = int(end_idx)
-    for idx in range(int(end_idx) + 1, signal_arr.size):
-        if time_arr[idx] - time_arr[end_idx] > max_extend_s:
-            break
-        if signal_arr[idx] >= expand_thr:
-            last_above = idx
-        elif time_arr[idx] - time_arr[last_above] >= quiet_s:
-            break
-    return start_idx, last_above
-
-
-def _merge_intervals(intervals, max_gap: float):
-    if not intervals:
-        return []
-    ordered = sorted(intervals, key=lambda item: item[0])
-    merged = [[ordered[0][0], ordered[0][1]]]
-    for start, end in ordered[1:]:
-        if start - merged[-1][1] <= max_gap:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return [(start, end) for start, end in merged]
-
-
-def quantify_scheduled_pulses(
-    df: pd.DataFrame,
-    windows,
-    *,
-    baseline_seconds: float = 60.0,
-    min_duration_s: float = 0.08,
-    cluster_gap_s: float = 2.5,
-    min_area_gs: float = 0.0008,
-    min_abs_prominence: float = 0.010,
-    noise_sigma_factor: float = 4.0,
-    peak_min_distance_s: float = 0.05,
-    context_minutes: float = 20.0,
-    background_margin: float = 1.25,
-    manual_threshold: float | None = None,
-):
-    """Quantify at most one pulse inside each expected time window.
-
-    Uses the immediate pre-window baseline rather than a global magnitude
-    threshold, groups nearby fragments, and returns "not detected" when no
-    candidate clears local prominence/duration/area checks.
-
-    Each result also carries a background comparison drawn from the surrounding
-    recording, because a window-local threshold cannot by itself tell a real
-    stimulus apart from a periodic artifact that runs through the window.
-    """
-    if df is None or df.empty or "Vibration_Accel" not in df.columns:
-        return []
-    if "AbsoluteTime" not in df.columns:
-        raise ValueError("Scheduled pulse quantification requires AbsoluteTime.")
-
-    work = df[["AbsoluteTime", "Vibration_Accel"]].copy()
-    if "SourceFile" in df.columns:
-        work["SourceFile"] = df["SourceFile"]
-    work = work.sort_values("AbsoluteTime").reset_index(drop=True)
-    abs_time = pd.to_datetime(work["AbsoluteTime"])
-    if getattr(abs_time.dt, "tz", None) is not None:
-        abs_time = pd.to_datetime(abs_time.dt.strftime("%Y-%m-%d %H:%M:%S.%f"))
-    work["AbsoluteTime"] = abs_time
-    signal = work["Vibration_Accel"].to_numpy(dtype=float)
-    origin = abs_time.iloc[0]
-    time_s = (abs_time - origin).dt.total_seconds().to_numpy(dtype=float)
-
-    parsed_windows = []
+def _parse_window_bounds(windows):
+    """Normalize window objects/dicts to naive (start, end) timestamp pairs."""
+    parsed = []
     for window in windows or []:
         if hasattr(window, "start_iso"):
             window_start = pd.Timestamp(window.start_iso)
@@ -368,109 +360,218 @@ def quantify_scheduled_pulses(
             window_start = pd.Timestamp(window_start.to_pydatetime().replace(tzinfo=None))
         if window_end.tz is not None:
             window_end = pd.Timestamp(window_end.to_pydatetime().replace(tzinfo=None))
-        parsed_windows.append((window_start, window_end))
+        parsed.append((window_start, window_end))
+    return parsed
+
+
+def quantify_scheduled_pulses(
+    df: pd.DataFrame,
+    windows,
+    *,
+    exclude_windows=None,
+    start_index: int = 1,
+    envelope_window_s: float = 0.025,
+    floor_window_s: float = 120.0,
+    detection_sigma_factor: float = 6.0,
+    min_amplitude_g: float = 0.004,
+    edge_fraction: float = 0.15,
+    edge_sigma_factor: float = 3.0,
+    bridge_gap_s: float = 0.05,
+    min_duration_s: float = 0.04,
+    peak_min_distance_s: float = 0.002,
+    context_minutes: float = 20.0,
+    background_margin: float = 1.25,
+    manual_threshold: float | None = None,
+):
+    """Quantify at most one vibration burst inside each expected time window.
+
+    Everything is measured on the RMS envelope of the vibration magnitude, not
+    on the magnitude itself. The stimulus is an oscillation, so the raw trace
+    only stays above any level for a few milliseconds at a time; describing a
+    burst from those fragments needs gaps of seconds to be bridged, which glues
+    the stimulus to whatever else happened nearby. The envelope is the
+    amplitude curve the eye reads off the plot, and a burst is a single
+    contiguous excursion of it.
+
+    Per window the strongest excursion above the tracked noise floor is taken
+    as the candidate. It counts as a pulse when it clears the floor by both
+    `detection_sigma_factor` sigma and `min_amplitude_g`. Its extent runs to
+    where the envelope falls back to `edge_fraction` of the peak excursion, so
+    a loud pulse and a quiet one are measured at the same point on their own
+    decay rather than against a fixed level.
+
+    Each result also carries a background comparison drawn from the recording
+    either side of the window, because no window-local threshold can tell a
+    stimulus apart from a periodic artefact running through the window.
+
+    `min_duration_s` has to stay above `envelope_window_s`: the envelope spreads
+    a single bad ADC reading across exactly one window, so anything narrower
+    than that carries no energy and is a glitch rather than a pulse.
+
+    `df` only has to cover the windows being quantified plus their background
+    context. Callers that hand over one window at a time must still pass every
+    scheduled window as `exclude_windows`, so a neighbouring stimulus is not
+    mistaken for background, and `start_index` so numbering stays continuous.
+    """
+    # A window that no log file covers still has to report a row, so an empty
+    # frame is carried through the loop instead of short-circuiting the call.
+    if df is None or df.empty:
+        df = pd.DataFrame(
+            {
+                "AbsoluteTime": pd.Series(dtype="datetime64[ns]"),
+                "Vibration_Accel": pd.Series(dtype="float64"),
+            }
+        )
+    if "Vibration_Accel" not in df.columns:
+        raise ValueError("Scheduled pulse quantification requires Vibration_Accel.")
+    if "AbsoluteTime" not in df.columns:
+        raise ValueError("Scheduled pulse quantification requires AbsoluteTime.")
+
+    work = df[["AbsoluteTime", "Vibration_Accel"]].copy()
+    if "SourceFile" in df.columns:
+        work["SourceFile"] = df["SourceFile"]
+    # The logger stamps time in whole milliseconds while sampling faster than
+    # 1 kHz, so a third of the samples tie. Only a stable sort keeps them in
+    # acquisition order; an unstable one reorders ties differently depending on
+    # how much data was handed in, which moves the reported areas and peak
+    # counts around.
+    work = work.sort_values("AbsoluteTime", kind="stable").reset_index(drop=True)
+    abs_time = pd.to_datetime(work["AbsoluteTime"])
+    if getattr(abs_time.dt, "tz", None) is not None:
+        abs_time = pd.to_datetime(abs_time.dt.strftime("%Y-%m-%d %H:%M:%S.%f"))
+    work["AbsoluteTime"] = abs_time
+    signal = work["Vibration_Accel"].to_numpy(dtype=float)
+    origin = abs_time.iloc[0] if abs_time.size else pd.Timestamp(0)
+    time_s = (abs_time - origin).dt.total_seconds().to_numpy(dtype=float)
+    sources = work["SourceFile"].to_numpy() if "SourceFile" in work.columns else None
+
+    stamps = abs_time.to_numpy().astype("int64")
+    envelope = rms_envelope(signal, stamps, envelope_window_s)
+    floor_track, scale_track = estimate_noise_floor(envelope, stamps, floor_window_s)
+    excess_track = envelope - floor_track
+
+    parsed_windows = _parse_window_bounds(windows)
+    excluded_windows = (
+        _parse_window_bounds(exclude_windows) if exclude_windows is not None else parsed_windows
+    )
 
     results = []
-    for index, (window_start, window_end) in enumerate(parsed_windows, start=1):
-        win_mask = (abs_time >= window_start) & (abs_time <= window_end)
-        win_time = time_s[win_mask.to_numpy()]
-        win_signal = signal[win_mask.to_numpy()]
-        source_file = ""
-        same_source = None
-        if "SourceFile" in work.columns and win_mask.any():
-            source_file = str(work.loc[win_mask, "SourceFile"].iloc[0])
-            same_source = (work["SourceFile"] == source_file).to_numpy()
-
-        baseline, mad = estimate_local_baseline(
-            abs_time,
-            signal,
-            window_start,
-            window_end,
-            baseline_seconds=baseline_seconds,
-            exclude_spans=parsed_windows,
-            restrict_mask=same_source,
-        )
-        noise_sigma = 1.4826 * mad
-        local_threshold = baseline + max(noise_sigma_factor * noise_sigma, min_abs_prominence)
-        threshold = float(manual_threshold) if manual_threshold is not None else local_threshold
-        peak_prominence = max(3.0 * noise_sigma, 0.008)
+    for index, (window_start, window_end) in enumerate(parsed_windows, start=int(start_index)):
+        win_mask = ((abs_time >= window_start) & (abs_time <= window_end)).to_numpy()
+        win_idx = np.flatnonzero(win_mask)
 
         detected = False
         pulse_start_ts = None
         pulse_end_ts = None
         offset_start_s = np.nan
         offset_end_s = np.nan
-        duration_s = 0.0
-        peak_force = 0.0
-        area = 0.0
-        n_peaks = 0
-        frequency = 0.0
-
-        if win_time.size >= 3:
-            peak_idx = int(np.argmax(win_signal))
-            peak_force = float(win_signal[peak_idx])
-            peak_time = float(win_time[peak_idx])
-            if peak_force >= threshold and peak_force - baseline >= min_abs_prominence:
-                runs = _merge_intervals(_threshold_runs(win_time, win_signal, threshold), cluster_gap_s)
-                chosen = next((run for run in runs if run[0] <= peak_time <= run[1]), None)
-                if chosen is None and runs:
-                    chosen = min(runs, key=lambda run: min(abs(peak_time - run[0]), abs(peak_time - run[1])))
-                    if min(abs(peak_time - chosen[0]), abs(peak_time - chosen[1])) > 0.25:
-                        chosen = None
-                if chosen is not None:
-                    cluster_mask = (win_time >= chosen[0]) & (win_time <= chosen[1])
-                    cluster_idxs = np.flatnonzero(cluster_mask)
-                    if cluster_idxs.size:
-                        start_idx = int(cluster_idxs[0])
-                        end_idx = int(cluster_idxs[-1])
-                        expand_thr = baseline + max(2.5 * noise_sigma, 0.012)
-                        expand_thr = min(expand_thr, threshold)
-                        start_idx, end_idx = _expand_run_edges(
-                            win_time, win_signal, start_idx, end_idx, expand_thr
-                        )
-                        start_s = float(win_time[start_idx])
-                        end_s = float(win_time[end_idx])
-                        cluster_time = win_time[start_idx : end_idx + 1]
-                        cluster_signal = win_signal[start_idx : end_idx + 1]
-                        duration_s = float(end_s - start_s)
-                        area = calculate_baseline_adjusted_area(cluster_time, cluster_signal, baseline)
-                        if duration_s >= min_duration_s and area >= min_area_gs:
-                            detected = True
-                            pulse_start_ts = origin + pd.to_timedelta(start_s, unit="s")
-                            pulse_end_ts = origin + pd.to_timedelta(end_s, unit="s")
-                            offset_start_s = (pulse_start_ts - window_start).total_seconds()
-                            offset_end_s = (pulse_end_ts - window_start).total_seconds()
-                            n_peaks = count_prominent_peaks(
-                                cluster_signal, cluster_time, peak_prominence, peak_min_distance_s
-                            )
-                            frequency = float(n_peaks) / float(max(duration_s, 1e-6))
-                            if "SourceFile" in work.columns:
-                                source_idx = work.index[win_mask][peak_idx]
-                                source_file = str(work.loc[source_idx, "SourceFile"])
-
-        bg_count, bg_p99, bg_max = summarize_background_peaks(
-            abs_time,
-            signal,
-            window_start,
-            window_end,
-            exclude_spans=parsed_windows,
-            restrict_mask=same_source,
-            context_minutes=context_minutes,
-            min_height=baseline + max(2.0 * noise_sigma, 0.5 * min_abs_prominence),
-        )
-        # Compare excursions above baseline, not raw peak heights, so the
-        # comparison is not dominated by a baseline offset. Clearing the
-        # background maximum by a hair is not evidence of a stimulus, hence
-        # the margin requirement.
+        duration_s = np.nan
+        peak_force = np.nan
+        peak_amplitude = np.nan
+        noise_floor = np.nan
+        detect_level = np.nan
+        edge_level = np.nan
+        snr = np.nan
+        area = np.nan
+        n_peaks = np.nan
+        peak_rate = np.nan
+        source_file = ""
+        bg_count, bg_p99, bg_max = 0, float("nan"), float("nan")
         background_ratio = float("nan")
-        if detected and np.isfinite(bg_p99):
-            bg_excess = max(bg_p99 - baseline, 1e-9)
-            background_ratio = (peak_force - baseline) / bg_excess
+
+        if win_idx.size >= 3:
+            # Of the excursions large enough to be a pulse at all, take the one
+            # that stands out most from its own surroundings rather than the
+            # tallest. Over a window an hour wide the tallest is as likely to be
+            # someone knocking the bench during a busy few minutes, while the
+            # stimulus is the one that towers over a quiet stretch.
+            if manual_threshold is not None:
+                eligible = win_idx[envelope[win_idx] >= float(manual_threshold)]
+            else:
+                eligible = win_idx[excess_track[win_idx] >= min_amplitude_g]
+            if eligible.size:
+                anchor = int(eligible[int(np.argmax(excess_track[eligible] / scale_track[eligible]))])
+            else:
+                anchor = int(win_idx[int(np.argmax(excess_track[win_idx]))])
+            noise_floor = float(floor_track[anchor])
+            sigma = float(scale_track[anchor])
+            peak_amplitude = float(envelope[anchor])
+            peak_excess = peak_amplitude - noise_floor
+            snr = peak_excess / max(sigma, _MIN_SCALE_G)
+            if manual_threshold is not None:
+                detect_level = float(manual_threshold)
+            else:
+                detect_level = noise_floor + max(detection_sigma_factor * sigma, min_amplitude_g)
+
+            if peak_amplitude >= detect_level:
+                if manual_threshold is not None:
+                    edge_level = float(manual_threshold)
+                else:
+                    edge_level = noise_floor + max(
+                        edge_fraction * peak_excess, edge_sigma_factor * sigma
+                    )
+                edge_level = min(edge_level, peak_amplitude)
+                # Bounds are found across the whole frame rather than inside the
+                # window, so a burst that starts a moment before the expected
+                # window is measured whole instead of being clipped by it.
+                start_idx, end_idx = find_burst_bounds(
+                    time_s, envelope, anchor, edge_level, bridge_gap_s
+                )
+                duration_s = float(time_s[end_idx] - time_s[start_idx])
+                if duration_s >= min_duration_s:
+                    detected = True
+                    span = slice(start_idx, end_idx + 1)
+                    pulse_start_ts = origin + pd.to_timedelta(time_s[start_idx], unit="s")
+                    pulse_end_ts = origin + pd.to_timedelta(time_s[end_idx], unit="s")
+                    offset_start_s = (pulse_start_ts - window_start).total_seconds()
+                    offset_end_s = (pulse_end_ts - window_start).total_seconds()
+                    peak_force = float(signal[span].max())
+                    area = float(
+                        _trapezoid(np.clip(excess_track[span], 0.0, None), time_s[span])
+                    )
+                    # Prominence scales with this burst, so the count means the
+                    # same thing for a faint pulse and a violent one.
+                    n_peaks = count_prominent_peaks(
+                        signal[span],
+                        time_s[span],
+                        max(0.25 * (peak_force - noise_floor), 2.0 * sigma),
+                        peak_min_distance_s,
+                    )
+                    peak_rate = float(n_peaks) / max(duration_s, 1e-6)
+                    if sources is not None:
+                        source_file = str(sources[anchor])
+            if not detected:
+                duration_s = np.nan
+                if sources is not None:
+                    source_file = str(sources[anchor])
+
+            level = (
+                detect_level - noise_floor
+                if manual_threshold is not None
+                else max(detection_sigma_factor * sigma, min_amplitude_g)
+            )
+            bg_count, bg_p99, bg_max = summarize_background_bursts(
+                abs_time,
+                excess_track,
+                window_start,
+                window_end,
+                exclude_spans=excluded_windows,
+                burst_span=(pulse_start_ts, pulse_end_ts) if detected else None,
+                context_minutes=context_minutes,
+                level=level,
+            )
+            # Both sides of the comparison are excursions above the local floor,
+            # so a drifting floor cannot make a pulse look big. Clearing the
+            # loudest background event by a hair is not evidence of a stimulus,
+            # hence the margin.
+            if detected and np.isfinite(bg_p99):
+                background_ratio = peak_excess / max(bg_p99, 1e-9)
+
         if not detected or not np.isfinite(bg_max):
             background_check = "no comparison"
-        elif peak_force > bg_max and background_ratio >= background_margin:
+        elif peak_amplitude - noise_floor > bg_max and background_ratio >= background_margin:
             background_check = "distinct"
-        elif peak_force > bg_p99:
+        elif peak_amplitude - noise_floor > bg_p99:
             background_check = "marginal"
         else:
             background_check = "matches background"
@@ -488,16 +589,19 @@ def quantify_scheduled_pulses(
                 "Pulse Start (s from window)": float(offset_start_s) if detected else np.nan,
                 "Pulse End (s from window)": float(offset_end_s) if detected else np.nan,
                 "Duration (s)": float(duration_s) if detected else np.nan,
-                "Baseline (g)": float(baseline),
-                "Threshold (g)": float(threshold),
-                "Baseline-Adjusted Area (g·s)": float(area) if detected else np.nan,
                 "Peak Force (g)": float(peak_force) if detected else np.nan,
-                "Background Peak p99 (g)": float(bg_p99),
-                "Background Peak Max (g)": float(bg_max),
-                "Background Peak Count": int(bg_count),
+                "Peak Amplitude (g RMS)": float(peak_amplitude),
+                "Noise Floor (g RMS)": float(noise_floor),
+                "Detection Threshold (g RMS)": float(detect_level),
+                "Edge Threshold (g RMS)": float(edge_level) if detected else np.nan,
+                "Signal-to-Noise (x)": float(snr),
+                "Area Above Noise (g·s)": float(area) if detected else np.nan,
+                "Background Burst p99 (g RMS)": float(bg_p99),
+                "Background Burst Max (g RMS)": float(bg_max),
+                "Background Burst Count": int(bg_count),
                 "Peak / Background p99": float(background_ratio),
                 "# peaks": int(n_peaks) if detected else np.nan,
-                "Frequency (Hz)": float(frequency) if detected else np.nan,
+                "Peak Rate (Hz)": float(peak_rate) if detected else np.nan,
                 "SourceFile": source_file,
                 "detected": detected,
                 "expected_start": window_start,
@@ -540,7 +644,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-mins-bucket", type=int, default=5,
                         help="Minimum spacing in minutes between highlighted peaks (default: 5)")
     parser.add_argument("--threshold", type=float, default=None,
-                        help="Manual threshold (g) for pulse detection. If not specified, uses adaptive thresholding.")
+                        help="Manual RMS envelope threshold (g) for pulse detection. "
+                             "If not specified, the local noise floor sets it.")
     parser.add_argument(
         "--pulse-window",
         action="append",

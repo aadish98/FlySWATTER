@@ -481,6 +481,7 @@ def _plot_protocol(df: pd.DataFrame, pulses, filename_start_dt: Optional[datetim
         )
 
     _apply_wall_clock_xaxis(ax1)
+    ax1.xaxis.set_major_locator(mdates.HourLocator(byhour=[0, 8, 12, 20]))
     ax1.legend(
         handles=[
             Patch(facecolor="#ffe066", edgecolor="none", alpha=0.35, label="Day (lights on)"),

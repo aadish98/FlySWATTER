@@ -28,9 +28,20 @@ class FunctionWorker(QRunnable):
             result = self.func(*self.args, progress_callback=self.report_progress, **self.kwargs)
         except Exception as exc:  # pragma: no cover - surfaced in GUI runtime
             tb = traceback.format_exc()
-            self.signals.error.emit(f"{exc}\n\n{tb}")
+            self._emit("error", f"{exc}\n\n{tb}")
         else:
-            self.signals.finished.emit(result)
+            self._emit("finished", result)
 
     def report_progress(self, value: int, message: str) -> None:
-        self.signals.progress.emit(value, message)
+        self._emit("progress", value, message)
+
+    def _emit(self, name: str, *args: Any) -> None:
+        """Emit a result signal, tolerating a receiver that no longer exists.
+
+        If the signal carrier has been destroyed there is nobody left to tell,
+        and letting that error escape run() terminates the application.
+        """
+        try:
+            getattr(self.signals, name).emit(*args)
+        except RuntimeError:
+            pass

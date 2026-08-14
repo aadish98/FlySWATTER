@@ -82,11 +82,26 @@ class FlySwatterMainWindow(QMainWindow):
         ]:
             self.stack.addWidget(screen)
 
-        self._current_worker = None
+        self._active_workers = set()
         self._pulse_folder_summary = None
         self._connect_signals()
         self._refresh_researcher_names()
         self.stack.setCurrentWidget(self.welcome_screen)
+
+    def _track_worker(self, worker) -> None:
+        """Hold a reference to a worker until it reports back.
+
+        A worker only stays alive through this reference. If it is dropped
+        while the job is still running, the QObject carrying its signals is
+        collected and the next progress update raises "Signal source has been
+        deleted", which takes the app down mid-analysis.
+        """
+        self._active_workers.add(worker)
+        worker.signals.finished.connect(lambda *_: self._active_workers.discard(worker), Qt.QueuedConnection)
+        worker.signals.error.connect(lambda *_: self._active_workers.discard(worker), Qt.QueuedConnection)
+
+    def _analysis_in_progress(self) -> bool:
+        return bool(self._active_workers)
 
     def _connect_signals(self) -> None:
         self.welcome_screen.continueRequested.connect(self._handle_researcher_continue)
@@ -193,7 +208,7 @@ class FlySwatterMainWindow(QMainWindow):
         worker.setAutoDelete(False)
         worker.signals.finished.connect(self._handle_score_finished, Qt.QueuedConnection)
         worker.signals.error.connect(self._handle_worker_error, Qt.QueuedConnection)
-        self._current_worker = worker
+        self._track_worker(worker)
         self.score_progress_screen.start_indeterminate(
             f"Scoring sleep & arousal using {self.state.score_sleep_minutes} minute inactivity threshold\u2026\n"
             "Processing typically takes ~2-6 minutes to complete."
@@ -202,7 +217,6 @@ class FlySwatterMainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _handle_score_finished(self, result) -> None:
-        self._current_worker = None
         self.score_progress_screen.finish("Score analysis complete.")
         self.state.score_result = result
         self.score_results_screen.set_result(result)
@@ -246,13 +260,12 @@ class FlySwatterMainWindow(QMainWindow):
         worker.setAutoDelete(False)
         worker.signals.finished.connect(self._handle_folder_summary_ready, Qt.QueuedConnection)
         worker.signals.error.connect(self._handle_folder_scan_error, Qt.QueuedConnection)
-        self._current_worker = worker
+        self._track_worker(worker)
         self.pulse_progress_screen.start_indeterminate("Scanning folder for time window bounds\u2026")
         self.stack.setCurrentWidget(self.pulse_progress_screen)
         self.thread_pool.start(worker)
 
     def _handle_folder_summary_ready(self, summary) -> None:
-        self._current_worker = None
         self._pulse_folder_summary = summary
         try:
             self.time_window_screen.set_summary(summary)
@@ -264,7 +277,6 @@ class FlySwatterMainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.time_window_screen)
 
     def _handle_folder_scan_error(self, message: str) -> None:
-        self._current_worker = None
         self.pulse_progress_screen.finish()
         self._show_error("Failed to scan folder.", [message])
         self.stack.setCurrentWidget(self.pulse_upload_screen)
@@ -275,6 +287,9 @@ class FlySwatterMainWindow(QMainWindow):
             return
         if not pulse_windows:
             self._show_error("Add at least one expected pulse window before starting analysis.")
+            return
+        if self._analysis_in_progress():
+            self._show_error("An analysis is already running. Wait for it to finish before starting another.")
             return
         output_dir = build_run_output_dir(self.data_root, self.state.researcher_name)
         worker = FunctionWorker(
@@ -288,7 +303,7 @@ class FlySwatterMainWindow(QMainWindow):
         worker.setAutoDelete(False)
         worker.signals.finished.connect(self._handle_pulse_finished, Qt.QueuedConnection)
         worker.signals.error.connect(self._handle_worker_error, Qt.QueuedConnection)
-        self._current_worker = worker
+        self._track_worker(worker)
         try:
             n_files = estimate_window_file_count(
                 self.state.selected_pulse_folder,
@@ -298,8 +313,10 @@ class FlySwatterMainWindow(QMainWindow):
         except Exception:
             n_files = len(self._pulse_folder_summary.csv_files) if self._pulse_folder_summary else 1
         n_files = max(n_files, 1)
-        est_min = n_files * 90
-        est_max = n_files * 240
+        # Roughly a second per log file plus aggregation and rendering; the
+        # upper bound allows for slow network shares.
+        est_min = 10 + n_files * 2
+        est_max = 30 + n_files * 8
         self.pulse_progress_screen.start_timed(
             est_min,
             "Starting pulse metrics analysis\u2026",
@@ -309,7 +326,6 @@ class FlySwatterMainWindow(QMainWindow):
         self.thread_pool.start(worker)
 
     def _handle_pulse_finished(self, result) -> None:
-        self._current_worker = None
         self.pulse_progress_screen.finish("Pulse metrics analysis complete.")
         self.state.pulse_result = result
         self.pulse_results_screen.set_result(result)
@@ -339,7 +355,6 @@ class FlySwatterMainWindow(QMainWindow):
             QMessageBox.information(self, "Saved", f"Saved a copy to:\n{destination}")
 
     def _handle_worker_error(self, message: str) -> None:
-        self._current_worker = None
         self.score_progress_screen.finish()
         self.pulse_progress_screen.finish()
         self._show_error("Analysis failed.", [message])

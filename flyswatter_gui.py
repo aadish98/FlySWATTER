@@ -14,6 +14,7 @@ from pathlib import Path
 # Force single-threaded BLAS to prevent Bus errors in worker threads.
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
+from PySide6.QtCore import QThread
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gui.main_window import FlySwatterMainWindow
@@ -44,6 +45,10 @@ def _install_crash_handler(data_root: Path) -> None:
         text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         sys.stderr.write(text)
         log_path = _write_crash_log(data_root, text)
+        app = QApplication.instance()
+        if app is None or QThread.currentThread() is not app.thread():
+            # Widgets may only be built on the GUI thread; the log is enough here.
+            return
         try:
             box = QMessageBox()
             box.setIcon(QMessageBox.Critical)
