@@ -1,145 +1,138 @@
-"""Time-window selection screen for pulse-metrics analysis."""
+"""Schedule editor for pulse-metrics analysis."""
 
 from __future__ import annotations
 
-import math
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QPointF, QDateTime, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
+    QDateTimeEdit,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from services.models import FolderWindowSummary
 from gui.theme import DARK_THEME
-from gui.widgets.range_slider_widget import RangeSliderWidget
+from services.models import FolderWindowSummary
 
-_ANALYSIS_STEP_MINUTES = 5
-_PULSE_STEP_MINUTES = 1
-_DEFAULT_PULSE_MINUTES = 5
+_DEFAULT_SEARCH_RADIUS_MINUTES = 5
 _DEFAULT_PULSE_SPACING = timedelta(hours=2)
+_DATE_TIME_FORMAT = "MMM d, yyyy  h:mm AP"
 
 
-class _PulseWindowRow(QFrame):
+def _to_qdatetime(value: datetime) -> QDateTime:
+    return QDateTime(value)
+
+
+class _PulseTimeRow(QFrame):
     removed = Signal(object)
-    rangeChanged = Signal()
+    timeChanged = Signal()
 
     def __init__(
         self,
         *,
         range_start_dt: datetime,
         range_end_dt: datetime,
-        start_dt: datetime,
-        end_dt: datetime,
+        pulse_dt: datetime,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self._range_start_dt = range_start_dt
-        self._range_end_dt = range_end_dt
-        self._step_minutes = _PULSE_STEP_MINUTES
-        self._updating = False
-        self.setFrameShape(QFrame.StyledPanel)
+        self.setObjectName("pulseTimeRow")
         self.setStyleSheet(
-            f"QFrame {{ background: {DARK_THEME.surface_alt}; border: 1px solid {DARK_THEME.border}; border-radius: 8px; }}"
+            f"""
+            QFrame#pulseTimeRow {{
+                background: {DARK_THEME.surface_alt};
+                border: 1px solid {DARK_THEME.border};
+                border-radius: 10px;
+            }}
+            """
         )
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 10, 10)
+        layout.setSpacing(12)
 
-        header = QHBoxLayout()
-        self.title_label = QLabel("Pulse window")
+        self.title_label = QLabel("Pulse")
+        self.title_label.setMinimumWidth(62)
         self.title_label.setStyleSheet("font-weight: 700;")
+
+        self.time_edit = QDateTimeEdit()
+        self.time_edit.setDisplayFormat(_DATE_TIME_FORMAT)
+        self.time_edit.setCalendarPopup(True)
+        self.time_edit.setMinimumDateTime(_to_qdatetime(range_start_dt))
+        self.time_edit.setMaximumDateTime(_to_qdatetime(range_end_dt))
+        self.time_edit.setDateTime(_to_qdatetime(pulse_dt))
+        self.time_edit.setMinimumWidth(230)
+        self.time_edit.dateTimeChanged.connect(lambda _value: self.timeChanged.emit())
+
         remove_button = QPushButton("Remove")
+        remove_button.setToolTip("Remove this expected pulse")
         remove_button.clicked.connect(lambda: self.removed.emit(self))
-        header.addWidget(self.title_label)
-        header.addStretch(1)
-        header.addWidget(remove_button)
 
-        self.range_slider = RangeSliderWidget()
-        self.range_slider.rangeChanged.connect(self._handle_slider_changed)
-        selected_row = QHBoxLayout()
-        self.start_label = QLabel("Start: -")
-        self.end_label = QLabel("End: -")
-        self.start_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
-        self.end_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
-        selected_row.addWidget(self.start_label)
-        selected_row.addStretch(1)
-        selected_row.addWidget(self.end_label)
-
-        layout.addLayout(header)
-        layout.addWidget(self.range_slider)
-        layout.addLayout(selected_row)
-        self.set_bounds(range_start_dt, range_end_dt)
-        self.set_window(start_dt, end_dt, emit=False)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.time_edit, 1)
+        layout.addWidget(remove_button)
 
     def set_title(self, text: str) -> None:
         self.title_label.setText(text)
 
-    def set_bounds(self, range_start_dt: datetime, range_end_dt: datetime) -> None:
-        self._range_start_dt = range_start_dt
-        self._range_end_dt = range_end_dt
-        self.range_slider.set_bounds(0, self._max_step())
-        start_dt, end_dt = self.window_datetimes()
-        self.set_window(start_dt, end_dt, emit=False)
+    def pulse_datetime(self) -> datetime:
+        return self.time_edit.dateTime().toPython()
 
-    def set_window(self, start_dt: datetime, end_dt: datetime, *, emit: bool = True) -> None:
-        lower = self._datetime_to_step(start_dt)
-        upper = self._datetime_to_step(end_dt)
-        if upper <= lower:
-            upper = min(lower + _DEFAULT_PULSE_MINUTES, self._max_step())
-        self._updating = True
-        self.range_slider.set_range(lower, upper, emit=False)
-        self._updating = False
-        self._refresh_labels()
-        if emit:
-            self.rangeChanged.emit()
 
-    def window_datetimes(self) -> tuple[datetime, datetime]:
-        start_dt = self._step_to_datetime(self.range_slider.lower_value())
-        end_dt = self._step_to_datetime(self.range_slider.upper_value())
-        if end_dt <= start_dt:
-            end_dt = min(start_dt + timedelta(minutes=_DEFAULT_PULSE_MINUTES), self._range_end_dt)
-        return start_dt, end_dt
+class _PulseTimeline(QWidget):
+    """Compact, read-only overview of pulse positions in the recording."""
 
-    def as_dict(self) -> dict[str, str]:
-        start_dt, end_dt = self.window_datetimes()
-        return {"start_iso": start_dt.isoformat(), "end_iso": end_dt.isoformat()}
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._start: datetime | None = None
+        self._end: datetime | None = None
+        self._pulses: list[datetime] = []
+        self.setMinimumHeight(86)
 
-    def _handle_slider_changed(self, _lower: int, _upper: int) -> None:
-        if self._updating:
+    def set_data(self, start: datetime, end: datetime, pulses: list[datetime]) -> None:
+        self._start = start
+        self._end = end
+        self._pulses = sorted(pulses)
+        self.update()
+
+    def paintEvent(self, _event) -> None:
+        if self._start is None or self._end is None:
             return
-        self._refresh_labels()
-        self.rangeChanged.emit()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        left, right = 18.0, float(max(self.width() - 18, 19))
+        line_y = 32.0
 
-    def _refresh_labels(self) -> None:
-        start_dt, end_dt = self.window_datetimes()
-        self.start_label.setText(f"Start: {TimeWindowScreen._format_dt(start_dt)}")
-        self.end_label.setText(f"End: {TimeWindowScreen._format_dt(end_dt)}")
+        painter.setPen(QPen(QColor(DARK_THEME.border), 4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(left, line_y), QPointF(right, line_y))
 
-    def _max_step(self) -> int:
-        total_seconds = max((self._range_end_dt - self._range_start_dt).total_seconds(), 0.0)
-        return max(int(math.ceil(total_seconds / (self._step_minutes * 60))), 1)
+        span = max((self._end - self._start).total_seconds(), 1.0)
+        painter.setPen(QPen(QColor(DARK_THEME.accent_hover), 2))
+        painter.setBrush(QColor(DARK_THEME.accent))
+        for pulse in self._pulses:
+            ratio = min(max((pulse - self._start).total_seconds() / span, 0.0), 1.0)
+            x_pos = left + ratio * (right - left)
+            painter.drawEllipse(QPointF(x_pos, line_y), 6, 6)
 
-    def _datetime_to_step(self, value: datetime) -> int:
-        clamped = min(max(value, self._range_start_dt), self._range_end_dt)
-        minutes = (clamped - self._range_start_dt).total_seconds() / 60.0
-        return int(round(minutes / self._step_minutes))
-
-    def _step_to_datetime(self, step: int) -> datetime:
-        resolved = self._range_start_dt + timedelta(minutes=self._step_minutes * int(step))
-        if resolved > self._range_end_dt:
-            return self._range_end_dt
-        if resolved < self._range_start_dt:
-            return self._range_start_dt
-        return resolved
+        painter.setPen(QColor(DARK_THEME.text_muted))
+        painter.drawText(0, 55, self.width() // 2, 24, Qt.AlignLeft, TimeWindowScreen._format_dt(self._start))
+        painter.drawText(
+            self.width() // 2,
+            55,
+            self.width() // 2,
+            24,
+            Qt.AlignRight,
+            TimeWindowScreen._format_dt(self._end),
+        )
 
 
 class TimeWindowScreen(QWidget):
@@ -150,16 +143,11 @@ class TimeWindowScreen(QWidget):
         super().__init__(parent)
         self._range_start_dt: datetime | None = None
         self._range_end_dt: datetime | None = None
-        self._selected_start_dt: datetime | None = None
-        self._selected_end_dt: datetime | None = None
-        self._max_slider_step = 1
-        self._step_minutes = _ANALYSIS_STEP_MINUTES
-        self._updating_controls = False
-        self._pulse_rows: list[_PulseWindowRow] = []
+        self._pulse_rows: list[_PulseTimeRow] = []
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(50, 36, 50, 36)
-        layout.setSpacing(14)
+        layout.setContentsMargins(50, 30, 50, 30)
+        layout.setSpacing(12)
 
         header = QHBoxLayout()
         back_button = QPushButton("Back")
@@ -167,120 +155,173 @@ class TimeWindowScreen(QWidget):
         header.addWidget(back_button)
         header.addStretch(1)
 
-        title = QLabel("Select Time Window to Analyze")
+        title = QLabel("Schedule Expected Pulses")
         title.setStyleSheet("font-size: 22px; font-weight: 700;")
-        self.summary_label = QLabel("")
+        subtitle = QLabel(
+            "Enter the scheduled time of each pulse. FlySWATTER will search around those times automatically."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(f"color: {DARK_THEME.text_secondary};")
+
+        summary_panel = QFrame()
+        summary_panel.setObjectName("recordingSummary")
+        summary_panel.setStyleSheet(
+            f"""
+            QFrame#recordingSummary {{
+                background: {DARK_THEME.surface};
+                border: 1px solid {DARK_THEME.border};
+                border-radius: 12px;
+            }}
+            """
+        )
+        summary_layout = QVBoxLayout(summary_panel)
+        summary_layout.setContentsMargins(14, 10, 14, 10)
+        self.summary_label = QLabel("No recording selected")
         self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet(f"font-size: 13px; color: {DARK_THEME.text_secondary};")
+        self.summary_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
+        summary_layout.addWidget(self.summary_label)
 
-        available_row = QHBoxLayout()
-        self.available_start_label = QLabel("Available start: -")
-        self.available_end_label = QLabel("Available end: -")
-        self.available_start_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
-        self.available_end_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
-        available_row.addWidget(self.available_start_label)
-        available_row.addStretch(1)
-        available_row.addWidget(self.available_end_label)
+        search_row = QHBoxLayout()
+        search_label = QLabel("Search")
+        search_label.setStyleSheet("font-weight: 700;")
+        self.search_radius_input = QSpinBox()
+        self.search_radius_input.setRange(1, 120)
+        self.search_radius_input.setValue(_DEFAULT_SEARCH_RADIUS_MINUTES)
+        self.search_radius_input.setSuffix(" min")
+        self.search_radius_input.setFixedWidth(92)
+        self.search_radius_input.valueChanged.connect(self._refresh_schedule)
+        search_help = QLabel("before and after each scheduled time")
+        search_help.setStyleSheet(f"color: {DARK_THEME.text_secondary};")
+        search_row.addWidget(search_label)
+        search_row.addWidget(self.search_radius_input)
+        search_row.addWidget(search_help)
+        search_row.addStretch(1)
 
-        self.range_slider = RangeSliderWidget()
-        self.range_slider.rangeChanged.connect(self._handle_slider_changed)
+        self.timeline = _PulseTimeline()
 
-        selected_row = QHBoxLayout()
-        self.selected_start_label = QLabel("Selected start: -")
-        self.selected_end_label = QLabel("Selected end: -")
-        self.selected_start_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
-        self.selected_end_label.setStyleSheet(f"font-weight: 600; color: {DARK_THEME.text_primary};")
-        selected_row.addWidget(self.selected_start_label)
-        selected_row.addStretch(1)
-        selected_row.addWidget(self.selected_end_label)
-
-        self.slider_help_label = QLabel("Drag the two slider handles to choose the overall analysis range.")
-        self.slider_help_label.setStyleSheet(f"font-size: 12px; color: {DARK_THEME.text_muted};")
+        series_panel = QFrame()
+        series_panel.setObjectName("seriesPanel")
+        series_panel.setStyleSheet(
+            f"""
+            QFrame#seriesPanel {{
+                background: {DARK_THEME.surface};
+                border: 1px solid {DARK_THEME.border};
+                border-radius: 12px;
+            }}
+            """
+        )
+        series_layout = QVBoxLayout(series_panel)
+        series_layout.setContentsMargins(14, 10, 14, 12)
+        series_layout.setSpacing(8)
+        series_title = QLabel("Create a repeating schedule")
+        series_title.setStyleSheet("font-weight: 700;")
+        series_controls = QHBoxLayout()
+        self.series_start_edit = QDateTimeEdit()
+        self.series_start_edit.setDisplayFormat(_DATE_TIME_FORMAT)
+        self.series_start_edit.setCalendarPopup(True)
+        self.series_start_edit.setMinimumWidth(210)
+        self.series_interval_input = QDoubleSpinBox()
+        self.series_interval_input.setRange(0.25, 48.0)
+        self.series_interval_input.setSingleStep(0.25)
+        self.series_interval_input.setValue(2.0)
+        self.series_interval_input.setSuffix(" hr")
+        self.series_interval_input.setFixedWidth(90)
+        self.series_count_input = QSpinBox()
+        self.series_count_input.setRange(1, 100)
+        self.series_count_input.setValue(4)
+        self.series_count_input.setSuffix(" pulses")
+        self.series_count_input.setFixedWidth(100)
+        generate_button = QPushButton("Replace schedule")
+        generate_button.clicked.connect(self._replace_with_series)
+        series_controls.addWidget(QLabel("First pulse"))
+        series_controls.addWidget(self.series_start_edit, 1)
+        series_controls.addWidget(QLabel("every"))
+        series_controls.addWidget(self.series_interval_input)
+        series_controls.addWidget(QLabel("for"))
+        series_controls.addWidget(self.series_count_input)
+        series_controls.addWidget(generate_button)
+        series_layout.addWidget(series_title)
+        series_layout.addLayout(series_controls)
 
         pulse_header = QHBoxLayout()
-        pulse_title = QLabel("Expected Pulse Windows")
-        pulse_title.setStyleSheet("font-size: 18px; font-weight: 700;")
-        add_button = QPushButton("Add pulse window")
+        pulse_title = QLabel("Pulse schedule")
+        pulse_title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        add_button = QPushButton("Add pulse")
         add_button.clicked.connect(self.add_pulse_window)
         pulse_header.addWidget(pulse_title)
         pulse_header.addStretch(1)
         pulse_header.addWidget(add_button)
 
-        self.pulse_help_label = QLabel(
-            "Add one window around each delivered pulse. Detection only runs inside these windows."
-        )
-        self.pulse_help_label.setStyleSheet(f"font-size: 12px; color: {DARK_THEME.text_muted};")
-        self.pulse_help_label.setWordWrap(True)
-
         self.pulse_list = QWidget()
         self.pulse_list_layout = QVBoxLayout(self.pulse_list)
         self.pulse_list_layout.setContentsMargins(0, 0, 0, 0)
-        self.pulse_list_layout.setSpacing(10)
+        self.pulse_list_layout.setSpacing(8)
         self.pulse_list_layout.addStretch(1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidget(self.pulse_list)
-        scroll.setMinimumHeight(180)
+        scroll.setMinimumHeight(150)
 
-        buttons = QHBoxLayout()
+        footer = QHBoxLayout()
+        self.schedule_status_label = QLabel("")
+        self.schedule_status_label.setStyleSheet(f"color: {DARK_THEME.text_muted};")
         continue_button = QPushButton("Start Analysis")
         continue_button.clicked.connect(self._emit_continue)
-        buttons.addStretch(1)
-        buttons.addWidget(continue_button)
+        footer.addWidget(self.schedule_status_label)
+        footer.addStretch(1)
+        footer.addWidget(continue_button)
 
         layout.addLayout(header)
         layout.addWidget(title)
-        layout.addWidget(self.summary_label)
-        layout.addLayout(available_row)
-        layout.addWidget(self.range_slider)
-        layout.addWidget(self.slider_help_label)
-        layout.addLayout(selected_row)
+        layout.addWidget(subtitle)
+        layout.addWidget(summary_panel)
+        layout.addLayout(search_row)
+        layout.addWidget(self.timeline)
+        layout.addWidget(series_panel)
         layout.addLayout(pulse_header)
-        layout.addWidget(self.pulse_help_label)
         layout.addWidget(scroll, 1)
-        layout.addLayout(buttons)
+        layout.addLayout(footer)
 
     def set_summary(self, summary: FolderWindowSummary) -> None:
         start_dt = datetime.fromisoformat(summary.start_ts_iso)
-        end_dt = datetime.fromisoformat(summary.end_ts_iso)
-        if end_dt < start_dt:
-            end_dt = start_dt
+        end_dt = max(datetime.fromisoformat(summary.end_ts_iso), start_dt)
         self._range_start_dt = start_dt
         self._range_end_dt = end_dt
-        total_seconds = max((end_dt - start_dt).total_seconds(), 0.0)
-        self._max_slider_step = max(int(math.ceil(total_seconds / (self._step_minutes * 60))), 1)
-        self.range_slider.set_bounds(0, self._max_slider_step)
-        self.range_slider.set_range(0, self._max_slider_step, emit=False)
-        self._sync_controls_from_slider()
-        self.available_start_label.setText(f"Available start: {self._format_dt(start_dt)}")
-        self.available_end_label.setText(f"Available end: {self._format_dt(end_dt)}")
         self.summary_label.setText(
-            f"Folder: {summary.display_name}\nAvailable range: {start_dt.strftime('%m-%d-%Y %I:%M %p')} to {end_dt.strftime('%m-%d-%Y %I:%M %p')}\nLog files found: {len(summary.csv_files)}"
+            f"{summary.display_name}  •  {len(summary.csv_files)} log files\n"
+            f"{self._format_dt(start_dt)}  →  {self._format_dt(end_dt)}"
         )
+        self.series_start_edit.setMinimumDateTime(_to_qdatetime(start_dt))
+        self.series_start_edit.setMaximumDateTime(_to_qdatetime(end_dt))
+        self.series_start_edit.setDateTime(_to_qdatetime(start_dt))
+        possible_count = int((end_dt - start_dt) / _DEFAULT_PULSE_SPACING) + 1
+        self.series_count_input.setValue(max(1, min(possible_count, 100)))
         self.clear_pulse_windows()
-        self.add_pulse_window()
+        self.add_pulse_window(pulse_dt=start_dt)
 
-    def add_pulse_window(self) -> None:
+    def add_pulse_window(self, _checked: bool = False, *, pulse_dt: datetime | None = None) -> None:
         if self._range_start_dt is None or self._range_end_dt is None:
             return
-        start_dt, end_dt = self._default_next_pulse_window()
-        row = _PulseWindowRow(
+        if pulse_dt is None:
+            pulse_dt = self._default_next_pulse_time()
+        pulse_dt = min(max(pulse_dt, self._range_start_dt), self._range_end_dt)
+        row = _PulseTimeRow(
             range_start_dt=self._range_start_dt,
             range_end_dt=self._range_end_dt,
-            start_dt=start_dt,
-            end_dt=end_dt,
+            pulse_dt=pulse_dt,
         )
         row.removed.connect(self._remove_pulse_row)
+        row.timeChanged.connect(self._refresh_schedule)
         self.pulse_list_layout.insertWidget(len(self._pulse_rows), row)
         self._pulse_rows.append(row)
-        self._refresh_pulse_titles()
+        self._refresh_schedule()
 
     def clear_pulse_windows(self) -> None:
         for row in list(self._pulse_rows):
             self._remove_pulse_row(row, refresh=False)
-        self._refresh_pulse_titles()
+        self._refresh_schedule()
 
     def remove_pulse_window_at(self, index: int) -> None:
         if 0 <= index < len(self._pulse_rows):
@@ -290,84 +331,88 @@ class TimeWindowScreen(QWidget):
         return len(self._pulse_rows)
 
     def pulse_windows(self) -> list[dict[str, str]]:
-        windows = [row.as_dict() for row in self._pulse_rows]
+        if self._range_start_dt is None or self._range_end_dt is None:
+            return []
+        radius = timedelta(minutes=self.search_radius_input.value())
+        windows = []
+        for row in self._pulse_rows:
+            pulse_dt = row.pulse_datetime()
+            start_dt = max(pulse_dt - radius, self._range_start_dt)
+            end_dt = min(pulse_dt + radius, self._range_end_dt)
+            windows.append({"start_iso": start_dt.isoformat(), "end_iso": end_dt.isoformat()})
         windows.sort(key=lambda item: item["start_iso"])
         return windows
 
-    def _remove_pulse_row(self, row: _PulseWindowRow, *, refresh: bool = True) -> None:
+    def _replace_with_series(self) -> None:
+        if self._range_start_dt is None or self._range_end_dt is None:
+            return
+        first = self.series_start_edit.dateTime().toPython()
+        spacing = timedelta(hours=self.series_interval_input.value())
+        count = self.series_count_input.value()
+        pulse_times = [first + spacing * index for index in range(count)]
+        outside_count = sum(pulse_dt > self._range_end_dt for pulse_dt in pulse_times)
+        if outside_count:
+            QMessageBox.warning(
+                self,
+                "Schedule exceeds recording",
+                f"{outside_count} pulse time(s) would occur after the recording ends. "
+                "Choose fewer pulses, an earlier first pulse, or a shorter interval.",
+            )
+            return
+        self.clear_pulse_windows()
+        for pulse_dt in pulse_times:
+            self.add_pulse_window(pulse_dt=pulse_dt)
+
+    def _remove_pulse_row(self, row: _PulseTimeRow, *, refresh: bool = True) -> None:
         if row not in self._pulse_rows:
             return
         self._pulse_rows.remove(row)
         self.pulse_list_layout.removeWidget(row)
         row.deleteLater()
         if refresh:
-            self._refresh_pulse_titles()
+            self._refresh_schedule()
 
-    def _refresh_pulse_titles(self) -> None:
-        ordered = sorted(self._pulse_rows, key=lambda row: row.window_datetimes()[0])
+    def _refresh_schedule(self) -> None:
+        ordered = sorted(self._pulse_rows, key=lambda row: row.pulse_datetime())
         for index, row in enumerate(ordered, start=1):
             row.set_title(f"Pulse {index}")
+        pulse_times = [row.pulse_datetime() for row in ordered]
+        if self._range_start_dt is not None and self._range_end_dt is not None:
+            self.timeline.set_data(self._range_start_dt, self._range_end_dt, pulse_times)
+        radius = self.search_radius_input.value()
+        self.schedule_status_label.setText(
+            f"{len(pulse_times)} pulse{'s' if len(pulse_times) != 1 else ''}  •  ±{radius} min search window"
+        )
 
-    def _default_next_pulse_window(self) -> tuple[datetime, datetime]:
+    def _default_next_pulse_time(self) -> datetime:
         assert self._range_start_dt is not None
         assert self._range_end_dt is not None
-        if self._pulse_rows:
-            last_start, _last_end = self._pulse_rows[-1].window_datetimes()
-            start_dt = last_start + _DEFAULT_PULSE_SPACING
-        else:
-            start_dt = self._selected_start_dt or self._range_start_dt
-        end_dt = start_dt + timedelta(minutes=_DEFAULT_PULSE_MINUTES)
-        if end_dt > self._range_end_dt:
-            end_dt = self._range_end_dt
-            start_dt = max(self._range_start_dt, end_dt - timedelta(minutes=_DEFAULT_PULSE_MINUTES))
-        if start_dt < self._range_start_dt:
-            start_dt = self._range_start_dt
-        if end_dt <= start_dt:
-            end_dt = min(start_dt + timedelta(minutes=_DEFAULT_PULSE_MINUTES), self._range_end_dt)
-        return start_dt, end_dt
+        if not self._pulse_rows:
+            return self._range_start_dt
+        latest = max(row.pulse_datetime() for row in self._pulse_rows)
+        return min(latest + _DEFAULT_PULSE_SPACING, self._range_end_dt)
 
     def _emit_continue(self) -> None:
-        start_dt = self._selected_start_dt or self._range_start_dt or datetime.now()
-        end_dt = self._selected_end_dt or self._range_end_dt or start_dt
-        if end_dt < start_dt:
-            end_dt = start_dt
         windows = self.pulse_windows()
         if not windows:
-            QMessageBox.warning(self, "Pulse window required", "Add at least one expected pulse window before starting analysis.")
+            QMessageBox.warning(
+                self,
+                "Pulse time required",
+                "Add at least one expected pulse time before starting analysis.",
+            )
             return
-        for index, window in enumerate(windows, start=1):
-            pulse_start = datetime.fromisoformat(window["start_iso"])
-            pulse_end = datetime.fromisoformat(window["end_iso"])
-            if pulse_end <= start_dt or pulse_start >= end_dt:
-                QMessageBox.warning(
-                    self,
-                    "Pulse window outside analysis range",
-                    f"Pulse {index} is outside the selected analysis range. Move the window or expand the analysis range.",
-                )
-                return
+        pulse_times = [row.pulse_datetime() for row in self._pulse_rows]
+        if len(set(pulse_times)) != len(pulse_times):
+            QMessageBox.warning(
+                self,
+                "Duplicate pulse times",
+                "Each expected pulse must have a different scheduled time.",
+            )
+            return
+        start_dt = datetime.fromisoformat(windows[0]["start_iso"])
+        end_dt = datetime.fromisoformat(windows[-1]["end_iso"])
         self.continueRequested.emit(start_dt.isoformat(), end_dt.isoformat(), windows)
-
-    def _handle_slider_changed(self, _lower: int, _upper: int) -> None:
-        if self._updating_controls:
-            return
-        self._sync_controls_from_slider()
-
-    def _sync_controls_from_slider(self) -> None:
-        start_dt = self._step_to_datetime(self.range_slider.lower_value())
-        end_dt = self._step_to_datetime(self.range_slider.upper_value())
-        self._selected_start_dt = start_dt
-        self._selected_end_dt = end_dt
-        self.selected_start_label.setText(f"Selected start: {self._format_dt(start_dt)}")
-        self.selected_end_label.setText(f"Selected end: {self._format_dt(end_dt)}")
-
-    def _step_to_datetime(self, step: int) -> datetime:
-        if self._range_start_dt is None:
-            return datetime.now()
-        resolved = self._range_start_dt + timedelta(minutes=self._step_minutes * int(step))
-        if self._range_end_dt is not None and resolved > self._range_end_dt:
-            return self._range_end_dt
-        return resolved
 
     @staticmethod
     def _format_dt(value: datetime) -> str:
-        return value.strftime("%m-%d-%Y %I:%M %p")
+        return _to_qdatetime(value).toString(_DATE_TIME_FORMAT)

@@ -49,13 +49,55 @@ def test_time_window_screen_add_remove_and_order():
     screen.add_pulse_window()
     screen.add_pulse_window()
     assert screen.pulse_window_count() == 3
+    pulse_times = [row.pulse_datetime() for row in screen._pulse_rows]
+    assert pulse_times[1] - pulse_times[0] == timedelta(hours=2)
     starts = [datetime.fromisoformat(item["start_iso"]) for item in screen.pulse_windows()]
     assert starts == sorted(starts)
-    assert starts[1] - starts[0] == timedelta(hours=2)
+    assert starts[0] == datetime(2026, 8, 11, 10, 0)
+    assert starts[1] == datetime(2026, 8, 11, 11, 55)
     screen.remove_pulse_window_at(0)
     assert screen.pulse_window_count() == 2
     labels = [row.title_label.text() for row in screen._pulse_rows]
     assert "Pulse 1" in labels
+    app.processEvents()
+
+
+def test_time_window_screen_builds_series_and_infers_analysis_range():
+    from PySide6.QtCore import QDateTime
+    from PySide6.QtTest import QSignalSpy
+    from PySide6.QtWidgets import QApplication
+
+    from gui.screens.time_window_screen import TimeWindowScreen
+
+    app = QApplication.instance() or QApplication([])
+    screen = TimeWindowScreen()
+    screen.set_summary(
+        FolderWindowSummary(
+            display_name="overnight",
+            manifest_path=Path("manifest.json"),
+            start_ts_iso="2026-08-11T10:00:00",
+            end_ts_iso="2026-08-11T20:00:00",
+            csv_files=[Path("a.csv")],
+        )
+    )
+    screen.series_start_edit.setDateTime(QDateTime(datetime(2026, 8, 11, 12, 0)))
+    screen.series_interval_input.setValue(2)
+    screen.series_count_input.setValue(3)
+    screen._replace_with_series()
+
+    assert [row.pulse_datetime() for row in screen._pulse_rows] == [
+        datetime(2026, 8, 11, 12, 0),
+        datetime(2026, 8, 11, 14, 0),
+        datetime(2026, 8, 11, 16, 0),
+    ]
+
+    spy = QSignalSpy(screen.continueRequested)
+    screen._emit_continue()
+    assert spy.count() == 1
+    start_iso, end_iso, windows = spy.at(0)
+    assert start_iso == "2026-08-11T11:55:00"
+    assert end_iso == "2026-08-11T16:05:00"
+    assert len(windows) == 3
     app.processEvents()
 
 
