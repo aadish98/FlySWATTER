@@ -12,6 +12,7 @@ datas += collect_data_files("matplotlib", include_py_files=False)
 
 hiddenimports = [
     "ConvertAcclLogsToPlots",
+    "ConvertMonitorLogsToPlots",
     "ScoreArousability",
     "openpyxl.styles",
 ]

@@ -17,9 +17,9 @@ import pandas as pd
 from matplotlib.artist import setp as _mpl_setp
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
 from matplotlib.ticker import MultipleLocator
 
+from ConvertMonitorLogsToPlots import get_monitor_temperature_at, read_monitor_temperature_file
 from ScoreArousability import (
     _ensure_numeric,
     _parse_start_datetime_from_filename,
@@ -33,6 +33,7 @@ from services.models import ScoreAnalysisResult
 from services.output_packaging import create_zip_from_paths
 from services.plot_axes import apply_wall_clock_xaxis
 from services.power_management import prevent_sleep
+from services.temperature_plot import render_temperature_protocol_plot, segments_from_states
 
 ProgressCallback = Optional[Callable[[int, str], None]]
 
@@ -46,6 +47,7 @@ def run_score_analysis_from_mapping_file(
     post_sec: int = 120,
     max_pulses: int = 0,
     dry_run: bool = False,
+    monitor_file: Optional[str | Path] = None,
     progress_callback: ProgressCallback = None,
 ) -> ScoreAnalysisResult:
     mapping, genotype_order = load_mapping(str(mapping_file))
@@ -58,6 +60,7 @@ def run_score_analysis_from_mapping_file(
         post_sec=post_sec,
         max_pulses=max_pulses,
         dry_run=dry_run,
+        monitor_file=monitor_file,
         progress_callback=progress_callback,
     )
 
@@ -73,6 +76,7 @@ def run_score_analysis(
     sleep_threshold_sec: Optional[int] = None,
     max_pulses: int = 0,
     dry_run: bool = False,
+    monitor_file: Optional[str | Path] = None,
     progress_callback: ProgressCallback = None,
 ) -> ScoreAnalysisResult:
     input_path = Path(input_file)
@@ -100,6 +104,11 @@ def run_score_analysis(
         _ensure_numeric(df, ["TIME_BIN", "DAY", "HOUR", "VIB", "RUNTIME"])
         df["VIB"] = df["VIB"].fillna(0)
 
+        monitor_df = None
+        if monitor_file:
+            _emit(progress_callback, 8, "Loading monitor temperature log...")
+            monitor_df = read_monitor_temperature_file(monitor_file)
+
         base_day = int(pd.to_numeric(df["DAY"], errors="coerce").min())
         day_val = pd.to_numeric(df["DAY"], errors="coerce")
         hour_val = pd.to_numeric(df["HOUR"], errors="coerce")
@@ -111,6 +120,11 @@ def run_score_analysis(
         pulses = detect_pulses_by_row(df)
         if max_pulses and max_pulses > 0:
             pulses = pulses[:max_pulses]
+        if monitor_df is not None:
+            # The monitor log is the authoritative temperature source once it's
+            # supplied alongside the Zantiks file, so per-pulse temperatures are
+            # overridden here instead of using each pulse's Zantiks INT_TEMP1.
+            pulses = _apply_monitor_temperatures_to_pulses(pulses, monitor_df, filename_start_dt)
 
         _emit(progress_callback, 18, f"Scoring {len(pulses)} pulse(s) across {len(genotype_order)} genotype(s)...")
         compute_pulse_zt = _make_pulse_zt_computer(df, filename_start_dt)
@@ -136,7 +150,9 @@ def run_score_analysis(
 
         _emit(progress_callback, 52, "Rendering arousal plots...")
         arousal_plot_paths = _plot_aggregated_arousal(out_df, genotype_order, output_path, base)
-        protocol_plot = _plot_protocol(df, pulses, filename_start_dt, compute_pulse_zt, output_path, base)
+        protocol_plot = _plot_protocol(
+            df, pulses, filename_start_dt, compute_pulse_zt, output_path, base, monitor_df=monitor_df
+        )
 
         _emit(progress_callback, 72, "Generating sleep outputs...")
         sleep_outputs = _generate_sleep_outputs(
@@ -179,6 +195,9 @@ def run_score_analysis(
         sleep_zip=sleep_zip,
         preview_plot_paths=preview_paths,
         genotype_counts=genotype_counts,
+        temperature_source=(
+            f"Monitor log ({Path(monitor_file).name})" if monitor_df is not None else "Zantiks (INT_TEMP1)"
+        ),
     )
 
 
@@ -409,52 +428,63 @@ def _plot_aggregated_arousal(out_df: pd.DataFrame, genotype_order: List[str], ou
     return [fig_path]
 
 
-def _plot_protocol(df: pd.DataFrame, pulses, filename_start_dt: Optional[datetime], compute_pulse_zt, output_dir: Path, base: str) -> Optional[Path]:
+def _apply_monitor_temperatures_to_pulses(pulses, monitor_df: pd.DataFrame, filename_start_dt: Optional[datetime]):
+    """Replace each pulse's Zantiks INT_TEMP1 reading with the monitor log's
+    interpolated temperature at that pulse's wall-clock start time."""
+    if monitor_df is None or filename_start_dt is None:
+        return pulses
+    updated = []
+    for start_row, end_row, day, hour, _int_temp1, start_runtime in pulses:
+        temp = None
+        if pd.notna(start_runtime):
+            pulse_wc = filename_start_dt + timedelta(seconds=float(start_runtime))
+            temp = get_monitor_temperature_at(monitor_df, pulse_wc)
+        updated.append((start_row, end_row, day, hour, temp, start_runtime))
+    return updated
+
+
+def _plot_protocol(
+    df: pd.DataFrame,
+    pulses,
+    filename_start_dt: Optional[datetime],
+    compute_pulse_zt,
+    output_dir: Path,
+    base: str,
+    monitor_df: Optional[pd.DataFrame] = None,
+) -> Optional[Path]:
     if filename_start_dt is None:
         return None
-    missing_cols = [column for column in ["RUNTIME", "INT_TEMP1", "L_OR_D"] if column not in df.columns]
+    missing_cols = [column for column in ["RUNTIME", "L_OR_D"] if column not in df.columns]
     if missing_cols:
         return None
 
-    ld_df = df[["RUNTIME", "INT_TEMP1", "L_OR_D"]].copy()
+    ld_df = df[["RUNTIME", "L_OR_D"]].copy()
+    if "INT_TEMP1" in df.columns:
+        ld_df["INT_TEMP1"] = pd.to_numeric(df["INT_TEMP1"], errors="coerce")
     ld_df["RUNTIME"] = pd.to_numeric(ld_df["RUNTIME"], errors="coerce")
-    ld_df["INT_TEMP1"] = pd.to_numeric(ld_df["INT_TEMP1"], errors="coerce")
     ld_df = ld_df.dropna(subset=["RUNTIME"]).sort_values("RUNTIME")
     ld_df["is_light"] = ld_df["L_OR_D"].apply(_to_is_light)
     ld_df["wall_clock"] = filename_start_dt + pd.to_timedelta(ld_df["RUNTIME"], unit="s")
 
-    fig = Figure(figsize=(14, 8))
-    FigureCanvasAgg(fig)
-    ax1 = fig.subplots()
-    if ld_df["INT_TEMP1"].notna().any():
-        ax1.plot(ld_df["wall_clock"], ld_df["INT_TEMP1"], color="tab:red", linewidth=1.8, label="Internal Temp (°C)")
-        ax1.yaxis.set_major_locator(MultipleLocator(1))
-    ax1.set_ylabel("Temperature (°C)")
+    full_times = ld_df["wall_clock"].tolist()
+    xlim = (full_times[0], full_times[-1]) if len(full_times) > 1 else None
 
-    times = ld_df["wall_clock"].tolist()
-    states = ld_df["is_light"].tolist()
-    if times:
-        if len(times) > 1:
-            ax1.set_xlim(times[0], times[-1])
-            first_day = datetime.combine(times[0].date(), datetime.min.time())
-            last_day = datetime.combine(times[-1].date(), datetime.min.time())
-            day_cursor = first_day
-            while day_cursor <= last_day:
-                if times[0] <= day_cursor <= times[-1]:
-                    ax1.axvline(day_cursor, color="black", linestyle="--", linewidth=1.0, alpha=0.35, zorder=1)
-                day_cursor += timedelta(days=1)
-        seg_start = times[0]
-        seg_state = states[0]
-        for idx in range(1, len(times)):
-            if states[idx] != seg_state:
-                if seg_state is not None:
-                    ax1.axvspan(seg_start, times[idx], facecolor="#ffe066" if seg_state else "#001f3f", alpha=0.18, zorder=0)
-                seg_start = times[idx]
-                seg_state = states[idx]
-        if seg_state is not None:
-            ax1.axvspan(seg_start, times[-1], facecolor="#ffe066" if seg_state else "#001f3f", alpha=0.18, zorder=0)
+    if monitor_df is not None and full_times:
+        window_start, window_end = full_times[0], full_times[-1]
+        windowed = monitor_df[
+            (monitor_df["datetime"] >= window_start) & (monitor_df["datetime"] <= window_end)
+        ]
+        plot_times = windowed["datetime"].tolist()
+        plot_temps = windowed["temperature_c"].tolist()
+        temperature_label = "Monitor Temp (°C)"
+    else:
+        plot_times = full_times
+        plot_temps = ld_df["INT_TEMP1"].tolist() if "INT_TEMP1" in ld_df.columns else []
+        temperature_label = "Internal Temp (°C)"
 
-    x0_num, x1_num = ax1.get_xlim()
+    segments = segments_from_states(full_times, ld_df["is_light"].tolist())
+
+    pulse_annotations = []
     for pulse_i, (start_row, _end_row, _day, p_hour, _temp, start_runtime) in enumerate(pulses, start=1):
         if pd.isna(start_runtime):
             continue
@@ -463,43 +493,17 @@ def _plot_protocol(df: pd.DataFrame, pulses, filename_start_dt: Optional[datetim
         label_parts = [f"P#{pulse_i}", pulse_x.strftime("%I:%M %p").lstrip("0")]
         if pulse_zt is not None:
             label_parts.append(f"ZT{int(pulse_zt)}")
-        px_num = mdates.date2num(pulse_x)
-        frac = (px_num - x0_num) / (x1_num - x0_num) if (x1_num - x0_num) else 0.5
-        dx = 12 if frac < 0.08 else (-12 if frac > 0.92 else 0)
-        dy = [-50, -70, -90][(pulse_i - 1) % 3]
-        ax1.annotate(
-            "\n".join(label_parts),
-            xy=(pulse_x, -0.02),
-            xycoords=("data", "axes fraction"),
-            xytext=(dx, dy),
-            textcoords="offset points",
-            ha="center",
-            va="top",
-            fontsize=8,
-            clip_on=False,
-            arrowprops=dict(arrowstyle="-|>", lw=0.8, color="black"),
-        )
+        pulse_annotations.append((pulse_x, "\n".join(label_parts)))
 
-    _apply_wall_clock_xaxis(ax1)
-    ax1.xaxis.set_major_locator(mdates.HourLocator(byhour=[0, 8, 12, 20]))
-    ax1.legend(
-        handles=[
-            Patch(facecolor="#ffe066", edgecolor="none", alpha=0.35, label="Day (lights on)"),
-            Patch(facecolor="#001f3f", edgecolor="none", alpha=0.35, label="Night (lights off)"),
-        ],
-        loc="upper right",
-        bbox_to_anchor=(1.0, -0.28),
-        borderaxespad=0.0,
-        fontsize=8,
-        title="Light Cycle",
-        title_fontsize=8,
-        framealpha=0.9,
+    fig = render_temperature_protocol_plot(
+        plot_times,
+        plot_temps,
+        xlim=xlim,
+        light_dark_segments=segments,
+        pulse_annotations=pulse_annotations,
+        title="Temperature and Light/Dark Protocol Over Time",
+        temperature_label=temperature_label,
     )
-    ax1.set_xlabel("Wall Clock Time")
-    ax1.set_title("Temperature and Light/Dark Protocol Over Time")
-    ax1.grid(True, axis="x", which="major", alpha=0.4)
-    ax1.grid(True, axis="x", which="minor", alpha=0.2)
-    fig.tight_layout(rect=[0, 0.32, 1, 0.96])
     fig_path = output_dir / f"Temp_Light_WallClock_{base}.png"
     fig.savefig(fig_path, dpi=300, bbox_inches="tight")
     return fig_path

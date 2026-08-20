@@ -76,6 +76,7 @@ class ScoreResultsScreen(QWidget):
         )
         self.summary_label.setText(
             f"<p><b>Output folder:</b> {escape(str(result.output_dir))}</p>"
+            f"<p><b>Temperature source:</b> {escape(result.temperature_source)}</p>"
             f"<p><b>Genotype fly counts:</b></p>"
             f"<ul>{counts_html}</ul>"
         )

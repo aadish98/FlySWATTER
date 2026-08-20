@@ -28,7 +28,7 @@ dev = [
 flyswatter = "flyswatter_gui:main"
 
 [tool.setuptools]
-py-modules = ["flyswatter_gui", "ScoreArousability", "ConvertAcclLogsToPlots"]
+py-modules = ["flyswatter_gui", "ScoreArousability", "ConvertAcclLogsToPlots", "ConvertMonitorLogsToPlots"]
 
 [tool.setuptools.packages.find]
 include = ["gui*", "services*"]

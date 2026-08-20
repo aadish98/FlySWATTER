@@ -16,6 +16,7 @@ class AppState:
     data_root: Path
     researcher_name: str = ""
     selected_score_file: Optional[Path] = None
+    selected_monitor_file: Optional[Path] = None
     selected_pulse_folder: Optional[Path] = None
     genotype_order: List[str] = field(default_factory=list)
     genotype_mapping: Dict[str, List[str]] = field(default_factory=dict)
@@ -25,6 +26,7 @@ class AppState:
 
     def reset_score_flow(self) -> None:
         self.selected_score_file = None
+        self.selected_monitor_file = None
         self.genotype_order = []
         self.genotype_mapping = {}
         self.score_sleep_minutes = 5

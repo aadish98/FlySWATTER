@@ -32,7 +32,12 @@ from services.pulse_service import estimate_window_file_count, get_folder_window
 from services.researcher_store import load_researcher_names, save_researcher_name
 from services.run_paths import build_run_output_dir
 from services.score_service import run_score_analysis
-from services.validators import validate_accel_folder, validate_researcher_name, validate_score_file
+from services.validators import (
+    validate_accel_folder,
+    validate_monitor_file,
+    validate_researcher_name,
+    validate_score_file,
+)
 
 
 class FlySwatterMainWindow(QMainWindow):
@@ -144,6 +149,7 @@ class FlySwatterMainWindow(QMainWindow):
     def _show_score_upload(self) -> None:
         self.state.reset_score_flow()
         self.score_upload_screen.set_selected_path(str(self.state.selected_score_file or ""))
+        self.score_upload_screen.set_selected_monitor_path(str(self.state.selected_monitor_file or ""))
         self.stack.setCurrentWidget(self.score_upload_screen)
 
     def _show_pulse_upload(self) -> None:
@@ -152,7 +158,7 @@ class FlySwatterMainWindow(QMainWindow):
         self.pulse_upload_screen.set_selected_path(str(self.state.selected_pulse_folder or ""))
         self.stack.setCurrentWidget(self.pulse_upload_screen)
 
-    def _handle_score_file_selected(self, file_path: str) -> None:
+    def _handle_score_file_selected(self, file_path: str, monitor_path: str = "") -> None:
         try:
             validation = validate_score_file(file_path)
         except OSError as exc:
@@ -173,6 +179,27 @@ class FlySwatterMainWindow(QMainWindow):
                 help_document=validation.help_document,
             )
             return
+
+        monitor_path = (monitor_path or "").strip()
+        if monitor_path:
+            try:
+                monitor_validation = validate_monitor_file(monitor_path)
+            except OSError as exc:
+                self._show_error(
+                    "Could not read the selected monitor temperature log.",
+                    [
+                        str(exc),
+                        "If the file is on a network drive, confirm it is still mounted.",
+                    ],
+                )
+                return
+            if not monitor_validation.valid:
+                self._show_error(monitor_validation.message, monitor_validation.details)
+                return
+            self.state.selected_monitor_file = Path(monitor_path)
+        else:
+            self.state.selected_monitor_file = None
+
         self.state.selected_score_file = Path(file_path)
         self.state.genotype_order = get_default_genotype_order()
         self.state.genotype_mapping = get_default_mapping()
@@ -204,6 +231,7 @@ class FlySwatterMainWindow(QMainWindow):
             output_dir,
             pre_sec=sleep_threshold_sec,
             sleep_threshold_sec=sleep_threshold_sec,
+            monitor_file=self.state.selected_monitor_file,
         )
         worker.setAutoDelete(False)
         worker.signals.finished.connect(self._handle_score_finished, Qt.QueuedConnection)

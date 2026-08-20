@@ -56,15 +56,19 @@ If the macOS build script fails on `xattr` under `.git`, finish the PyInstaller 
 - Score flow: `welcome → choose_analysis → score_upload → well_mapping → sleep_definition → score_progress → score_results`
 - Pulse flow: `welcome → choose_analysis → pulse_upload → time_window → pulse_progress → pulse_results`
 
-**`services/score_service.py`** — orchestrates sleep/arousal scoring: validates input, calls `ScoreArousability.py`, builds Excel workbooks and plots.
+**`services/score_service.py`** — orchestrates sleep/arousal scoring: validates input, calls `ScoreArousability.py`, builds Excel workbooks and plots. Optionally accepts a `monitor_file` (TriKinetics DAM/DEnM `Monitor*.txt` log); when supplied, temperature (the protocol plot line + per-pulse `Temperature (°C)` values) is taken from the monitor log instead of the Zantiks file's `INT_TEMP1` column.
 
 **`services/pulse_service.py`** — orchestrates pulse analysis: discovers CSVs, calls `ConvertAcclLogsToPlots.py`, builds aggregated metrics and plots.
 
 **`ScoreArousability.py`** and **`ConvertAcclLogsToPlots.py`** — core algorithm modules at the project root. These contain the scientific signal-processing logic and are called directly by the services layer.
 
+**`ConvertMonitorLogsToPlots.py`** — parses TriKinetics DAM/DEnM `Monitor*.txt` environment-monitor logs (`read_monitor_temperature_file`) and renders a standalone temperature protocol plot (`plot_monitor_temperature`, runnable via `python3 ConvertMonitorLogsToPlots.py Monitor65.txt`). Also exposes `get_monitor_temperature_at` for interpolating a temperature at an arbitrary wall-clock time, used by `score_service.py` to override per-pulse temperatures when a monitor file is supplied.
+
+**`services/temperature_plot.py`** — shared matplotlib renderer (`render_temperature_protocol_plot`) for the "Temperature and Light/Dark Protocol" chart style, used by both `score_service._plot_protocol` and `ConvertMonitorLogsToPlots.plot_monitor_temperature` so the two stay visually identical.
+
 **`services/app_paths.py`** — detects PyInstaller frozen vs. source execution and resolves correct paths for resources and data output. Data writes to `Data/` in project root, with fallback to `~/Library/Application Support/FlySWATTER/Data` (macOS) or `%APPDATA%\FlySWATTER\Data` (Windows).
 
-**`services/validators.py`** — strict regex-based validation of Zantiks filenames and accelerometer folder structures before analysis begins.
+**`services/validators.py`** — strict regex-based validation of Zantiks filenames and accelerometer folder structures before analysis begins. The optional monitor temperature log only requires a `.txt` extension (`validate_monitor_file`).
 
 ### Key Data Flow
 
@@ -80,6 +84,6 @@ User selects file/folder
 
 ## PyInstaller Bundling
 
-`flyswatter_gui.spec` controls the build. It bundles `arousal_score_well_mapping.xlsx` as a data file and includes hidden imports for `ConvertAcclLogsToPlots`, `ScoreArousability`, and `openpyxl`. When running bundled, `app_paths.py` detects `sys.frozen` and adjusts all path resolution accordingly.
+`flyswatter_gui.spec` controls the build. It bundles `arousal_score_well_mapping.xlsx` as a data file and includes hidden imports for `ConvertAcclLogsToPlots`, `ConvertMonitorLogsToPlots`, `ScoreArousability`, and `openpyxl`. When running bundled, `app_paths.py` detects `sys.frozen` and adjusts all path resolution accordingly.
 
 The macOS build script creates a venv at `build/.macapp-venv` and clears extended attributes for codesign compatibility. Windows uses `--onefile`.

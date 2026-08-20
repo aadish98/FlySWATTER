@@ -29,6 +29,7 @@ class ScoreAnalysisResult:
     sleep_zip: Path
     preview_plot_paths: List[Path]
     genotype_counts: Dict[str, int]
+    temperature_source: str = "Zantiks (INT_TEMP1)"
 
 
 @dataclass

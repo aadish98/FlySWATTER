@@ -299,6 +299,15 @@ def main():
         action="store_true",
         help="Handle dry runs by adding dummy data when no real data is available",
     )
+    p.add_argument(
+        "--monitor-file",
+        default=None,
+        help=(
+            "Optional TriKinetics DAM/DEnM Monitor*.txt log. When provided, temperature "
+            "(protocol plot + per-pulse readings) is taken from this file instead of the "
+            "Zantiks file's INT_TEMP1 column."
+        ),
+    )
     args = p.parse_args()
 
     output_dir = Path(args.input_file).resolve().parent / 'results'
@@ -310,7 +319,9 @@ def main():
         post_sec=args.post_sec,
         max_pulses=args.max_pulses,
         dry_run=args.dry_run,
+        monitor_file=args.monitor_file,
     )
+    print(f"Temperature source: {result.temperature_source}")
     print(f"Arousal workbook: {result.arousal_workbook}")
     if result.protocol_plot is not None:
         print(f"Protocol plot: {result.protocol_plot}")

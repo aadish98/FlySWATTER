@@ -46,6 +46,21 @@ def validate_score_file(path: str | Path) -> ValidationResult:
     return ValidationResult(True)
 
 
+def validate_monitor_file(path: str | Path) -> ValidationResult:
+    """Validate an optional monitor temperature log upload.
+
+    The monitor log is only used for temperature plotting, so its only
+    structural requirement is that it's a .txt file (unlike the strict
+    filename checks applied to the primary Zantiks upload).
+    """
+    file_path = Path(path)
+    if not file_path.exists() or not file_path.is_file():
+        return ValidationResult(False, "Select a valid monitor temperature log file.")
+    if file_path.suffix.lower() != ".txt":
+        return ValidationResult(False, "The monitor temperature log must be a .txt file.")
+    return ValidationResult(True)
+
+
 def validate_manifest(path: Path) -> ValidationResult:
     if not path.exists():
         return ValidationResult(False, "Could not find manifest.json in the selected log folder.")
