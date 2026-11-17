@@ -12,6 +12,7 @@ class ChooseAnalysisScreen(QWidget):
     backRequested = Signal()
     scoreRequested = Signal()
     pulseRequested = Signal()
+    generalPulseRequested = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -32,14 +33,17 @@ class ChooseAnalysisScreen(QWidget):
         cards_row = QHBoxLayout()
         cards_row.setSpacing(28)
 
-        self.score_card = AnalysisCard("Score Zantiks Behavior Data", "score")
-        self.pulse_card = AnalysisCard("Compute Pulse Metrics", "pulse")
+        self.score_card = AnalysisCard("Sleep & Arousal Scoring", "score")
+        self.pulse_card = AnalysisCard("Scheduled Pulse Analysis", "pulse")
+        self.general_card = AnalysisCard("Pulse Detection in Windows", "general")
         self.score_card.clicked.connect(self.scoreRequested)
         self.pulse_card.clicked.connect(self.pulseRequested)
+        self.general_card.clicked.connect(self.generalPulseRequested)
 
         cards_row.addStretch(1)
         cards_row.addWidget(self.score_card)
         cards_row.addWidget(self.pulse_card)
+        cards_row.addWidget(self.general_card)
         cards_row.addStretch(1)
 
         layout.addLayout(header)

@@ -26,6 +26,10 @@ Data/
 logs/
 BATCH_SCRIPTS/logs/
 
+# User-authored scripts (kept local; never overwritten by updates)
+user_scripts/*
+!user_scripts/README.md
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

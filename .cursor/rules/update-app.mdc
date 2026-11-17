@@ -7,7 +7,8 @@ alwaysApply: true
 
 Whenever the user asks to update the app (e.g. "update the app", "pull the latest", "get the newest version", "rebuild with latest"), run this flow immediately:
 
-1. `git pull` from the repo remote.
+0. Follow `AGENTS.md` section 3 first: move custom scripts into `user_scripts/` and stash/save any accidental edits to tracked files. Never run `git clean` or `git reset --hard`.
+1. `git pull --ff-only` from the repo remote.
 2. Rebuild for the current OS:
    - macOS: `bash BATCH_SCRIPTS/build_flyswatter_mac_app.sh`
    - Windows: `powershell -ExecutionPolicy Bypass -File BATCH_SCRIPTS\build_flyswatter_windows_exe.ps1`

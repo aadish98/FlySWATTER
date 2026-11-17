@@ -20,6 +20,16 @@ class PulseUploadScreen(QWidget):
     backRequested = Signal()
     submitRequested = Signal(str)
 
+    _SCHEDULED_INSTRUCTIONS = (
+        "Drop the original accelerometer log folder here or browse to select it. "
+        "Folder and log filenames must remain unchanged."
+    )
+    _GENERAL_INSTRUCTIONS = (
+        "Drop any accelerometer log folder here or browse to select it. It only needs its "
+        "manifest.json and log files with t_ms, X, Y and Z columns; folder and file names "
+        "can be anything."
+    )
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QVBoxLayout(self)
@@ -32,13 +42,11 @@ class PulseUploadScreen(QWidget):
         header.addWidget(self.back_button)
         header.addStretch(1)
 
-        title = QLabel("Upload Accelerometer Log Folder")
-        title.setStyleSheet("font-size: 22px; font-weight: 700;")
+        self.title_label = QLabel("Upload Accelerometer Log Folder")
+        self.title_label.setStyleSheet("font-size: 22px; font-weight: 700;")
 
-        instructions = QLabel(
-            "Drop the original accelerometer log folder here or browse to select it. Folder and log filenames must remain unchanged."
-        )
-        instructions.setWordWrap(True)
+        self.instructions_label = QLabel(self._SCHEDULED_INSTRUCTIONS)
+        self.instructions_label.setWordWrap(True)
 
         self.path_edit = QLineEdit()
         self.path_edit.setPlaceholderText("No folder selected")
@@ -61,12 +69,23 @@ class PulseUploadScreen(QWidget):
         buttons.addWidget(self.submit_button)
 
         layout.addLayout(header)
-        layout.addWidget(title)
-        layout.addWidget(instructions)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.instructions_label)
         layout.addLayout(row)
         layout.addWidget(self.drop_widget, alignment=Qt.AlignHCenter)
         layout.addStretch(1)
         layout.addLayout(buttons)
+
+    def set_general_mode(self, enabled: bool) -> None:
+        """Swap the wording between the scheduled and the general analysis."""
+        self.title_label.setText(
+            "Upload Accelerometer Log Folder (General Pulse Metrics)"
+            if enabled
+            else "Upload Accelerometer Log Folder"
+        )
+        self.instructions_label.setText(
+            self._GENERAL_INSTRUCTIONS if enabled else self._SCHEDULED_INSTRUCTIONS
+        )
 
     def set_selected_path(self, path: str = "") -> None:
         self.path_edit.setText(path)

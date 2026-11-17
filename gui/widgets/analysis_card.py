@@ -109,6 +109,8 @@ def _build_icon(icon_kind: str, size: int, hovered: bool) -> QPixmap:
 
     if icon_kind == "score":
         _draw_sleep_fly(painter, QRectF(18, 32, size - 36, size - 54), fg, accent)
+    elif icon_kind == "general":
+        _draw_pulse_train(painter, QRectF(14, 24, size - 28, size - 48), fg, accent)
     else:
         _draw_pulse_fly(painter, QRectF(18, 24, size - 36, size - 36), fg, accent)
 
@@ -170,3 +172,22 @@ def _draw_pulse_fly(painter: QPainter, rect: QRectF, fg: QColor, accent: QColor)
     font.setPointSize(15)
     painter.setFont(font)
     painter.drawText(QRect(int(rect.left()), int(center.y()) - 24, 28, 24), Qt.AlignCenter, "F")
+
+
+def _draw_pulse_train(painter: QPainter, rect: QRectF, fg: QColor, accent: QColor) -> None:
+    """A trace with a run of pulses, bracketed by two analysis-window markers."""
+    baseline = rect.center().y() + 14
+    left = rect.left() + 6
+    right = rect.right() - 6
+    painter.setPen(QPen(fg, 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    painter.drawLine(QPointF(left, baseline), QPointF(right, baseline))
+    painter.drawLine(QPointF(left, baseline - 52), QPointF(left, baseline + 22))
+    painter.drawLine(QPointF(right, baseline - 52), QPointF(right, baseline + 22))
+
+    painter.setPen(QPen(accent, 4, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    span = right - left
+    heights = (22, 38, 30, 44, 26)
+    for index, height in enumerate(heights):
+        x_pos = left + span * (0.14 + 0.18 * index)
+        painter.drawLine(QPointF(x_pos - 5, baseline), QPointF(x_pos, baseline - height))
+        painter.drawLine(QPointF(x_pos, baseline - height), QPointF(x_pos + 5, baseline))

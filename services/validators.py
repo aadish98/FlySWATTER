@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Iterable, List
@@ -111,4 +112,67 @@ def validate_accel_folder(path: str | Path, csv_files: Iterable[Path] | None = N
             details,
         )
 
+    return ValidationResult(True)
+
+
+GENERAL_REQUIRED_COLUMNS = ("t_ms", "X", "Y", "Z")
+
+
+def _find_general_manifest(folder_path: Path) -> Path | None:
+    """The logger writes manifest.json beside the data folder or one level up."""
+    for candidate in (folder_path / "manifest.json", folder_path.parent / "manifest.json"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def validate_accel_folder_general(path: str | Path) -> ValidationResult:
+    """Validate an accelerometer log folder without any naming conventions.
+
+    Pulse detection reads timing from manifest.json and samples from the
+    t_ms/X/Y/Z columns, so those are the only things that have to be right.
+    Folder and file names are never inspected.
+    """
+    import pandas as pd
+
+    folder_path = Path(path)
+    if not folder_path.exists() or not folder_path.is_dir():
+        return ValidationResult(False, "Select a valid accelerometer log folder.")
+
+    manifest_path = _find_general_manifest(folder_path)
+    if manifest_path is None:
+        return ValidationResult(False, "Could not find manifest.json in the selected log folder.")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return ValidationResult(False, "manifest.json could not be read.", [str(exc)])
+    if not isinstance(manifest, dict) or "start_iso" not in manifest:
+        return ValidationResult(False, "manifest.json is missing the recording start time (start_iso).")
+
+    discovered_files = sorted(
+        child
+        for child in folder_path.rglob("*")
+        if child.is_file() and (child.name.lower().endswith(".csv") or child.name.lower().endswith(".csv.gz"))
+    )
+    if not discovered_files:
+        return ValidationResult(False, "No accelerometer log files were found in the selected folder.")
+
+    try:
+        header = pd.read_csv(discovered_files[0], nrows=0)
+    except Exception as exc:  # unreadable or corrupt file
+        return ValidationResult(
+            False,
+            "Could not read the first accelerometer log file.",
+            [f"{discovered_files[0].name}: {exc}"],
+        )
+    missing = [column for column in GENERAL_REQUIRED_COLUMNS if column not in header.columns]
+    if missing:
+        return ValidationResult(
+            False,
+            "The accelerometer log files are missing required columns.",
+            [
+                f"Missing column(s): {', '.join(missing)}",
+                f"Expected columns: {', '.join(GENERAL_REQUIRED_COLUMNS)}",
+            ],
+        )
     return ValidationResult(True)

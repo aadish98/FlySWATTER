@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThreadPool, QUrl
@@ -15,7 +16,9 @@ from PySide6.QtWidgets import (
 )
 
 from gui.app_state import AppState
+from gui.screens.analysis_range_screen import AnalysisRangeScreen
 from gui.screens.choose_analysis_screen import ChooseAnalysisScreen
+from gui.screens.general_pulse_results_screen import GeneralPulseResultsScreen
 from gui.screens.pulse_progress_screen import PulseProgressScreen
 from gui.screens.pulse_results_screen import PulseResultsScreen
 from gui.screens.pulse_upload_screen import PulseUploadScreen
@@ -28,12 +31,21 @@ from gui.screens.welcome_screen import WelcomeScreen
 from gui.screens.well_mapping_screen import WellMappingScreen
 from gui.workers import FunctionWorker
 from services.default_well_mapping import get_default_genotype_order, get_default_mapping, validate_default_mapping
-from services.pulse_service import estimate_window_file_count, get_folder_window_summary, run_pulse_analysis
+from services.models import AnalysisWindow
+from services.pulse_service import (
+    estimate_general_file_count,
+    estimate_window_file_count,
+    get_folder_window_summary,
+    rerender_general_pulse_outputs,
+    run_general_pulse_analysis,
+    run_pulse_analysis,
+)
 from services.researcher_store import load_researcher_names, save_researcher_name
 from services.run_paths import build_run_output_dir
 from services.score_service import run_score_analysis
 from services.validators import (
     validate_accel_folder,
+    validate_accel_folder_general,
     validate_monitor_file,
     validate_researcher_name,
     validate_score_file,
@@ -71,6 +83,8 @@ class FlySwatterMainWindow(QMainWindow):
         self.time_window_screen = TimeWindowScreen()
         self.pulse_progress_screen = PulseProgressScreen()
         self.pulse_results_screen = PulseResultsScreen()
+        self.analysis_range_screen = AnalysisRangeScreen()
+        self.general_results_screen = GeneralPulseResultsScreen()
 
         for screen in [
             self.welcome_screen,
@@ -84,11 +98,14 @@ class FlySwatterMainWindow(QMainWindow):
             self.time_window_screen,
             self.pulse_progress_screen,
             self.pulse_results_screen,
+            self.analysis_range_screen,
+            self.general_results_screen,
         ]:
             self.stack.addWidget(screen)
 
         self._active_workers = set()
         self._pulse_folder_summary = None
+        self._general_mode = False
         self._connect_signals()
         self._refresh_researcher_names()
         self.stack.setCurrentWidget(self.welcome_screen)
@@ -113,6 +130,7 @@ class FlySwatterMainWindow(QMainWindow):
         self.choose_screen.backRequested.connect(lambda: self.stack.setCurrentWidget(self.welcome_screen))
         self.choose_screen.scoreRequested.connect(self._show_score_upload)
         self.choose_screen.pulseRequested.connect(self._show_pulse_upload)
+        self.choose_screen.generalPulseRequested.connect(self._show_general_pulse_upload)
         self.score_upload_screen.backRequested.connect(lambda: self.stack.setCurrentWidget(self.choose_screen))
         self.score_upload_screen.submitRequested.connect(self._handle_score_file_selected)
         self.mapping_screen.backRequested.connect(lambda: self.stack.setCurrentWidget(self.score_upload_screen))
@@ -128,6 +146,12 @@ class FlySwatterMainWindow(QMainWindow):
         self.time_window_screen.continueRequested.connect(self._run_pulse_analysis)
         self.pulse_results_screen.downloadRequested.connect(self._handle_pulse_download)
         self.pulse_results_screen.restartRequested.connect(self._restart_to_choose_analysis)
+        self.analysis_range_screen.backRequested.connect(lambda: self.stack.setCurrentWidget(self.pulse_upload_screen))
+        self.analysis_range_screen.continueRequested.connect(self._run_general_pulse_analysis)
+        self.general_results_screen.downloadRequested.connect(self._handle_general_download)
+        self.general_results_screen.restartRequested.connect(self._restart_to_choose_analysis)
+        self.general_results_screen.editWindowsRequested.connect(self._edit_general_windows)
+        self.general_results_screen.rerenderRequested.connect(self._rerender_general_pulse)
 
     def _refresh_researcher_names(self) -> None:
         self.welcome_screen.set_researcher_names(load_researcher_names(self.data_root), self.state.researcher_name)
@@ -153,6 +177,16 @@ class FlySwatterMainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.score_upload_screen)
 
     def _show_pulse_upload(self) -> None:
+        self._general_mode = False
+        self.pulse_upload_screen.set_general_mode(False)
+        self.state.reset_pulse_flow()
+        self._pulse_folder_summary = None
+        self.pulse_upload_screen.set_selected_path(str(self.state.selected_pulse_folder or ""))
+        self.stack.setCurrentWidget(self.pulse_upload_screen)
+
+    def _show_general_pulse_upload(self) -> None:
+        self._general_mode = True
+        self.pulse_upload_screen.set_general_mode(True)
         self.state.reset_pulse_flow()
         self._pulse_folder_summary = None
         self.pulse_upload_screen.set_selected_path(str(self.state.selected_pulse_folder or ""))
@@ -261,8 +295,9 @@ class FlySwatterMainWindow(QMainWindow):
             self._copy_artifact(Path(key))
 
     def _handle_pulse_folder_selected(self, folder_path: str) -> None:
+        validate_folder = validate_accel_folder_general if self._general_mode else validate_accel_folder
         try:
-            validation = validate_accel_folder(folder_path)
+            validation = validate_folder(folder_path)
         except OSError as exc:
             # Network shares and privacy-protected locations fail here, and an
             # error escaping this slot would take the whole app down.
@@ -295,14 +330,15 @@ class FlySwatterMainWindow(QMainWindow):
 
     def _handle_folder_summary_ready(self, summary) -> None:
         self._pulse_folder_summary = summary
+        screen = self.analysis_range_screen if self._general_mode else self.time_window_screen
         try:
-            self.time_window_screen.set_summary(summary)
+            screen.set_summary(summary)
         except Exception as exc:
             self.pulse_progress_screen.finish()
             self._show_error("Could not prepare the time window screen.", [str(exc)])
             self.stack.setCurrentWidget(self.pulse_upload_screen)
             return
-        self.stack.setCurrentWidget(self.time_window_screen)
+        self.stack.setCurrentWidget(screen)
 
     def _handle_folder_scan_error(self, message: str) -> None:
         self.pulse_progress_screen.finish()
@@ -367,6 +403,111 @@ class FlySwatterMainWindow(QMainWindow):
         else:
             self._copy_artifact(Path(key))
 
+    def _run_general_pulse_analysis(self, windows: list, clock_offset_seconds: float) -> None:
+        if self.state.selected_pulse_folder is None:
+            self._show_error("Select an accelerometer log folder first.")
+            return
+        if not windows:
+            self._show_error("Add at least one analysis window before starting analysis.")
+            return
+        if self._analysis_in_progress():
+            self._show_error("An analysis is already running. Wait for it to finish before starting another.")
+            return
+        self.state.general_pulse_windows = [
+            AnalysisWindow(
+                start_iso=str(window["start_iso"]),
+                end_iso=str(window["end_iso"]),
+                label=str(window.get("label", "")),
+            )
+            for window in windows
+        ]
+        self.state.general_clock_offset_seconds = float(clock_offset_seconds)
+        output_dir = build_run_output_dir(self.data_root, self.state.researcher_name)
+        worker = FunctionWorker(
+            run_general_pulse_analysis,
+            self.state.selected_pulse_folder,
+            output_dir,
+            windows=windows,
+            clock_offset_seconds=float(clock_offset_seconds),
+        )
+        worker.setAutoDelete(False)
+        worker.signals.finished.connect(self._handle_general_pulse_finished, Qt.QueuedConnection)
+        worker.signals.error.connect(self._handle_worker_error, Qt.QueuedConnection)
+        self._track_worker(worker)
+        try:
+            n_files = estimate_general_file_count(
+                self.state.selected_pulse_folder, windows, float(clock_offset_seconds)
+            )
+        except Exception:
+            n_files = len(self._pulse_folder_summary.csv_files) if self._pulse_folder_summary else 1
+        n_files = max(n_files, 1)
+        # Each file is read once per window it touches, then scanned for pulses.
+        est_min = 15 + n_files * 4
+        est_max = 40 + n_files * 14
+        self.pulse_progress_screen.start_timed(
+            est_min,
+            "Starting general pulse metrics analysis\u2026",
+            estimated_seconds_max=est_max,
+        )
+        self.stack.setCurrentWidget(self.pulse_progress_screen)
+        self.thread_pool.start(worker)
+
+    def _handle_general_pulse_finished(self, result) -> None:
+        self.pulse_progress_screen.finish("General pulse metrics analysis complete.")
+        self.state.general_pulse_result = result
+        self.general_results_screen.set_result(result)
+        self.stack.setCurrentWidget(self.general_results_screen)
+
+    def _handle_general_download(self, key: str) -> None:
+        if self.state.general_pulse_result is None:
+            return
+        if key == "general_zip":
+            self._copy_artifact(self.state.general_pulse_result.zip_path)
+        else:
+            self._copy_artifact(Path(key))
+
+    def _edit_general_windows(self) -> None:
+        """Back to the window editor with the previous windows restored."""
+        self.analysis_range_screen.set_windows(
+            self.state.general_pulse_windows, self.state.general_clock_offset_seconds
+        )
+        self.stack.setCurrentWidget(self.analysis_range_screen)
+
+    def _rerender_general_pulse(self, clock_offset_seconds: float) -> None:
+        result = self.state.general_pulse_result
+        if result is None:
+            return
+        if self._analysis_in_progress():
+            self._show_error("An analysis is already running. Wait for it to finish before starting another.")
+            return
+        worker = FunctionWorker(rerender_general_pulse_outputs, result, float(clock_offset_seconds))
+        worker.setAutoDelete(False)
+        worker.signals.finished.connect(self._handle_general_rerender_finished, Qt.QueuedConnection)
+        worker.signals.error.connect(self._handle_general_rerender_error, Qt.QueuedConnection)
+        self._track_worker(worker)
+        self.general_results_screen.set_busy(True, "Re-rendering\u2026")
+        self.thread_pool.start(worker)
+
+    def _handle_general_rerender_finished(self, result) -> None:
+        # The windows were entered on the old clock; keep them on the same data.
+        shift = timedelta(seconds=result.clock_offset_seconds - self.state.general_clock_offset_seconds)
+        self.state.general_pulse_windows = [
+            AnalysisWindow(
+                start_iso=(datetime.fromisoformat(window.start_iso) + shift).isoformat(),
+                end_iso=(datetime.fromisoformat(window.end_iso) + shift).isoformat(),
+                label=window.label,
+            )
+            for window in self.state.general_pulse_windows
+        ]
+        self.state.general_clock_offset_seconds = result.clock_offset_seconds
+        self.state.general_pulse_result = result
+        self.general_results_screen.set_result(result)
+
+    def _handle_general_rerender_error(self, message: str) -> None:
+        self.general_results_screen.set_busy(False)
+        self.general_results_screen.set_clock_offset(self.state.general_clock_offset_seconds)
+        self._show_error("Could not re-render the results.", [message])
+
     def _restart_to_choose_analysis(self) -> None:
         self.state.reset_score_flow()
         self.state.reset_pulse_flow()
@@ -385,6 +526,7 @@ class FlySwatterMainWindow(QMainWindow):
     def _handle_worker_error(self, message: str) -> None:
         self.score_progress_screen.finish()
         self.pulse_progress_screen.finish()
+        self.general_results_screen.set_busy(False)
         self._show_error("Analysis failed.", [message])
         self.stack.setCurrentWidget(self.choose_screen)
 

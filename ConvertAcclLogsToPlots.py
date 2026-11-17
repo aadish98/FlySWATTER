@@ -5,6 +5,8 @@ import json
 import gc
 from pathlib import Path
 import ctypes
+from dataclasses import dataclass
+from typing import List, Optional
 import numpy as np
 import pandas as pd
 from scipy.ndimage import median_filter
@@ -364,6 +366,262 @@ def _parse_window_bounds(windows):
     return parsed
 
 
+@dataclass
+class _SignalTracks:
+    """A frame's vibration trace with the envelope and noise tracks derived from it."""
+
+    abs_time: pd.Series
+    signal: np.ndarray
+    origin: pd.Timestamp
+    time_s: np.ndarray
+    sources: Optional[np.ndarray]
+    envelope: np.ndarray
+    floor: np.ndarray
+    scale: np.ndarray
+    excess: np.ndarray
+
+
+def _build_signal_tracks(
+    df: pd.DataFrame, *, envelope_window_s: float, floor_window_s: float, caller: str
+) -> _SignalTracks:
+    # A window that no log file covers still has to report a row, so an empty
+    # frame is carried through instead of short-circuiting the call.
+    if df is None or df.empty:
+        df = pd.DataFrame(
+            {
+                "AbsoluteTime": pd.Series(dtype="datetime64[ns]"),
+                "Vibration_Accel": pd.Series(dtype="float64"),
+            }
+        )
+    if "Vibration_Accel" not in df.columns:
+        raise ValueError(f"{caller} requires Vibration_Accel.")
+    if "AbsoluteTime" not in df.columns:
+        raise ValueError(f"{caller} requires AbsoluteTime.")
+
+    work = df[["AbsoluteTime", "Vibration_Accel"]].copy()
+    if "SourceFile" in df.columns:
+        work["SourceFile"] = df["SourceFile"]
+    # The logger stamps time in whole milliseconds while sampling faster than
+    # 1 kHz, so a third of the samples tie. Only a stable sort keeps them in
+    # acquisition order; an unstable one reorders ties differently depending on
+    # how much data was handed in, which moves the reported areas and peak
+    # counts around.
+    work = work.sort_values("AbsoluteTime", kind="stable").reset_index(drop=True)
+    abs_time = pd.to_datetime(work["AbsoluteTime"])
+    if getattr(abs_time.dt, "tz", None) is not None:
+        abs_time = pd.to_datetime(abs_time.dt.strftime("%Y-%m-%d %H:%M:%S.%f"))
+    work["AbsoluteTime"] = abs_time
+    signal = work["Vibration_Accel"].to_numpy(dtype=float)
+    origin = abs_time.iloc[0] if abs_time.size else pd.Timestamp(0)
+    time_s = (abs_time - origin).dt.total_seconds().to_numpy(dtype=float)
+    sources = work["SourceFile"].to_numpy() if "SourceFile" in work.columns else None
+
+    stamps = abs_time.to_numpy().astype("int64")
+    envelope = rms_envelope(signal, stamps, envelope_window_s)
+    floor_track, scale_track = estimate_noise_floor(envelope, stamps, floor_window_s)
+    return _SignalTracks(
+        abs_time=abs_time,
+        signal=signal,
+        origin=origin,
+        time_s=time_s,
+        sources=sources,
+        envelope=envelope,
+        floor=floor_track,
+        scale=scale_track,
+        excess=envelope - floor_track,
+    )
+
+
+def _measure_burst(
+    *,
+    signal,
+    time_s,
+    excess_track,
+    start_idx: int,
+    end_idx: int,
+    noise_floor: float,
+    sigma: float,
+    peak_min_distance_s: float,
+) -> dict:
+    """Peak force, area, peak count and peak rate of one burst.
+
+    Shared by the scheduled and the general detector so a burst is measured
+    identically whichever way it was found.
+    """
+    span = slice(start_idx, end_idx + 1)
+    duration_s = float(time_s[end_idx] - time_s[start_idx])
+    peak_force = float(signal[span].max())
+    area = float(_trapezoid(np.clip(excess_track[span], 0.0, None), time_s[span]))
+    # Prominence scales with this burst, so the count means the same thing for
+    # a faint pulse and a violent one.
+    n_peaks = count_prominent_peaks(
+        signal[span],
+        time_s[span],
+        max(0.25 * (peak_force - noise_floor), 2.0 * sigma),
+        peak_min_distance_s,
+    )
+    return {
+        "duration_s": duration_s,
+        "peak_force": peak_force,
+        "area": area,
+        "n_peaks": int(n_peaks),
+        "peak_rate": float(n_peaks) / max(duration_s, 1e-6),
+    }
+
+
+def _local_burst_bounds(time_s, envelope, anchor: int, edge_level: float, bridge_gap_s: float):
+    """`find_burst_bounds` on a neighbourhood of the anchor instead of the frame.
+
+    Walking the whole frame for every burst is quadratic on a busy recording.
+    The neighbourhood doubles until the burst no longer touches its edges, so
+    the answer is the one the whole-frame search gives.
+    """
+    size = len(envelope)
+    half = max(int(round(30.0 / max(_sampling_interval(time_s[max(anchor - 50, 0) : anchor + 50]), 1e-6))), 100)
+    while True:
+        low = max(anchor - half, 0)
+        high = min(anchor + half + 1, size)
+        start, end = find_burst_bounds(
+            time_s[low:high], envelope[low:high], anchor - low, edge_level, bridge_gap_s
+        )
+        touches_low = start == 0 and low > 0
+        touches_high = end == high - low - 1 and high < size
+        if not (touches_low or touches_high):
+            return start + low, end + low
+        half *= 2
+
+
+def detect_all_pulses(
+    df: pd.DataFrame,
+    *,
+    core_start=None,
+    core_end=None,
+    envelope_window_s: float = 0.025,
+    floor_window_s: float = 120.0,
+    detection_sigma_factor: float = 6.0,
+    min_amplitude_g: float = 0.004,
+    edge_fraction: float = 0.15,
+    edge_sigma_factor: float = 3.0,
+    bridge_gap_s: float = 0.05,
+    min_duration_s: float = 0.04,
+    peak_min_distance_s: float = 0.002,
+):
+    """Find and measure every vibration burst in `df`, with no schedule.
+
+    Uses the scheduled detector's own envelope, noise floor, thresholds and
+    burst measurements, but scans the whole frame rather than looking inside
+    expected windows. Each stretch of envelope that clears the detection level
+    is anchored at its strongest sample and extended to the burst's own edge
+    level; bursts that end up overlapping are merged, and any shorter than
+    `min_duration_s` are dropped as glitches.
+
+    `df` should reach beyond [core_start, core_end) so the noise floor is
+    well-defined at its edges. Only bursts whose onset lies inside that span
+    are returned, which lets a long recording be cut into tiles without a burst
+    being counted by two of them. Returns dicts keyed like the scheduled rows,
+    in time order, with PulseIndex numbered from 1 within this call.
+    """
+    tracks = _build_signal_tracks(
+        df,
+        envelope_window_s=envelope_window_s,
+        floor_window_s=floor_window_s,
+        caller="Pulse detection",
+    )
+    envelope, floor_track, scale_track, excess = (
+        tracks.envelope,
+        tracks.floor,
+        tracks.scale,
+        tracks.excess,
+    )
+    time_s = tracks.time_s
+    if envelope.size < 3:
+        return []
+
+    detect_excess = np.maximum(detection_sigma_factor * scale_track, min_amplitude_g)
+    above = excess >= detect_excess
+    padded = np.concatenate(([False], above, [False]))
+    delta = np.diff(padded.astype(np.int8))
+    run_starts = np.flatnonzero(delta == 1)
+    run_ends = np.flatnonzero(delta == -1) - 1
+
+    # (start, end, anchor) per burst, merged on the fly while walking in order.
+    bursts: List[List[int]] = []
+    last_end = -1
+    for run_start, run_end in zip(run_starts, run_ends):
+        if run_start <= last_end:
+            continue
+        anchor = int(run_start + np.argmax(excess[run_start : run_end + 1]))
+        sigma = float(scale_track[anchor])
+        peak_excess = float(excess[anchor])
+        edge_level = float(floor_track[anchor]) + max(edge_fraction * peak_excess, edge_sigma_factor * sigma)
+        edge_level = min(edge_level, float(envelope[anchor]))
+        start_idx, end_idx = _local_burst_bounds(time_s, envelope, anchor, edge_level, bridge_gap_s)
+        last_end = max(last_end, end_idx)
+        if float(time_s[end_idx] - time_s[start_idx]) < min_duration_s:
+            continue
+        if bursts and start_idx <= bursts[-1][1]:
+            previous = bursts[-1]
+            previous[1] = max(previous[1], end_idx)
+            if excess[anchor] > excess[previous[2]]:
+                previous[2] = anchor
+        else:
+            bursts.append([start_idx, end_idx, anchor])
+
+    keep_start = pd.Timestamp(core_start) if core_start is not None else None
+    keep_end = pd.Timestamp(core_end) if core_end is not None else None
+    results = []
+    for start_idx, end_idx, anchor in bursts:
+        pulse_start_ts = tracks.origin + pd.to_timedelta(time_s[start_idx], unit="s")
+        pulse_end_ts = tracks.origin + pd.to_timedelta(time_s[end_idx], unit="s")
+        if keep_start is not None and pulse_start_ts < keep_start:
+            continue
+        if keep_end is not None and pulse_start_ts >= keep_end:
+            continue
+        noise_floor = float(floor_track[anchor])
+        sigma = float(scale_track[anchor])
+        peak_amplitude = float(envelope[anchor])
+        peak_excess = peak_amplitude - noise_floor
+        edge_level = min(
+            noise_floor + max(edge_fraction * peak_excess, edge_sigma_factor * sigma),
+            peak_amplitude,
+        )
+        measured = _measure_burst(
+            signal=tracks.signal,
+            time_s=time_s,
+            excess_track=excess,
+            start_idx=start_idx,
+            end_idx=end_idx,
+            noise_floor=noise_floor,
+            sigma=sigma,
+            peak_min_distance_s=peak_min_distance_s,
+        )
+        index = len(results) + 1
+        results.append(
+            {
+                "Order": f"Pulse {index}",
+                "PulseIndex": index,
+                "Detection Status": "detected",
+                "Pulse Start ts": pulse_start_ts.isoformat(),
+                "Pulse End ts": pulse_end_ts.isoformat(),
+                "Duration (s)": measured["duration_s"],
+                "Peak Force (g)": measured["peak_force"],
+                "Peak Amplitude (g RMS)": peak_amplitude,
+                "Noise Floor (g RMS)": noise_floor,
+                "Detection Threshold (g RMS)": noise_floor + float(detect_excess[anchor]),
+                "Edge Threshold (g RMS)": float(edge_level),
+                "Signal-to-Noise (x)": peak_excess / max(sigma, _MIN_SCALE_G),
+                "Area Above Noise (g·s)": measured["area"],
+                "# peaks": measured["n_peaks"],
+                "Peak Rate (Hz)": measured["peak_rate"],
+                "SourceFile": str(tracks.sources[anchor]) if tracks.sources is not None else "",
+                "detected": True,
+                "pulse_start": pulse_start_ts,
+                "pulse_end": pulse_end_ts,
+            }
+        )
+    return results
+
+
 def quantify_scheduled_pulses(
     df: pd.DataFrame,
     windows,
@@ -413,42 +671,21 @@ def quantify_scheduled_pulses(
     scheduled window as `exclude_windows`, so a neighbouring stimulus is not
     mistaken for background, and `start_index` so numbering stays continuous.
     """
-    # A window that no log file covers still has to report a row, so an empty
-    # frame is carried through the loop instead of short-circuiting the call.
-    if df is None or df.empty:
-        df = pd.DataFrame(
-            {
-                "AbsoluteTime": pd.Series(dtype="datetime64[ns]"),
-                "Vibration_Accel": pd.Series(dtype="float64"),
-            }
-        )
-    if "Vibration_Accel" not in df.columns:
-        raise ValueError("Scheduled pulse quantification requires Vibration_Accel.")
-    if "AbsoluteTime" not in df.columns:
-        raise ValueError("Scheduled pulse quantification requires AbsoluteTime.")
-
-    work = df[["AbsoluteTime", "Vibration_Accel"]].copy()
-    if "SourceFile" in df.columns:
-        work["SourceFile"] = df["SourceFile"]
-    # The logger stamps time in whole milliseconds while sampling faster than
-    # 1 kHz, so a third of the samples tie. Only a stable sort keeps them in
-    # acquisition order; an unstable one reorders ties differently depending on
-    # how much data was handed in, which moves the reported areas and peak
-    # counts around.
-    work = work.sort_values("AbsoluteTime", kind="stable").reset_index(drop=True)
-    abs_time = pd.to_datetime(work["AbsoluteTime"])
-    if getattr(abs_time.dt, "tz", None) is not None:
-        abs_time = pd.to_datetime(abs_time.dt.strftime("%Y-%m-%d %H:%M:%S.%f"))
-    work["AbsoluteTime"] = abs_time
-    signal = work["Vibration_Accel"].to_numpy(dtype=float)
-    origin = abs_time.iloc[0] if abs_time.size else pd.Timestamp(0)
-    time_s = (abs_time - origin).dt.total_seconds().to_numpy(dtype=float)
-    sources = work["SourceFile"].to_numpy() if "SourceFile" in work.columns else None
-
-    stamps = abs_time.to_numpy().astype("int64")
-    envelope = rms_envelope(signal, stamps, envelope_window_s)
-    floor_track, scale_track = estimate_noise_floor(envelope, stamps, floor_window_s)
-    excess_track = envelope - floor_track
+    tracks = _build_signal_tracks(
+        df,
+        envelope_window_s=envelope_window_s,
+        floor_window_s=floor_window_s,
+        caller="Scheduled pulse quantification",
+    )
+    abs_time = tracks.abs_time
+    signal = tracks.signal
+    origin = tracks.origin
+    time_s = tracks.time_s
+    sources = tracks.sources
+    envelope = tracks.envelope
+    floor_track = tracks.floor
+    scale_track = tracks.scale
+    excess_track = tracks.excess
 
     parsed_windows = _parse_window_bounds(windows)
     excluded_windows = (
@@ -520,24 +757,24 @@ def quantify_scheduled_pulses(
                 duration_s = float(time_s[end_idx] - time_s[start_idx])
                 if duration_s >= min_duration_s:
                     detected = True
-                    span = slice(start_idx, end_idx + 1)
                     pulse_start_ts = origin + pd.to_timedelta(time_s[start_idx], unit="s")
                     pulse_end_ts = origin + pd.to_timedelta(time_s[end_idx], unit="s")
                     offset_start_s = (pulse_start_ts - window_start).total_seconds()
                     offset_end_s = (pulse_end_ts - window_start).total_seconds()
-                    peak_force = float(signal[span].max())
-                    area = float(
-                        _trapezoid(np.clip(excess_track[span], 0.0, None), time_s[span])
+                    measured = _measure_burst(
+                        signal=signal,
+                        time_s=time_s,
+                        excess_track=excess_track,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        noise_floor=noise_floor,
+                        sigma=sigma,
+                        peak_min_distance_s=peak_min_distance_s,
                     )
-                    # Prominence scales with this burst, so the count means the
-                    # same thing for a faint pulse and a violent one.
-                    n_peaks = count_prominent_peaks(
-                        signal[span],
-                        time_s[span],
-                        max(0.25 * (peak_force - noise_floor), 2.0 * sigma),
-                        peak_min_distance_s,
-                    )
-                    peak_rate = float(n_peaks) / max(duration_s, 1e-6)
+                    peak_force = measured["peak_force"]
+                    area = measured["area"]
+                    n_peaks = measured["n_peaks"]
+                    peak_rate = measured["peak_rate"]
                     if sources is not None:
                         source_file = str(sources[anchor])
             if not detected:

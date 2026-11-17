@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -56,3 +56,48 @@ class FolderWindowSummary:
     start_ts_iso: str
     end_ts_iso: str
     csv_files: List[Path]
+
+
+@dataclass
+class AnalysisWindow:
+    """One user-defined stretch of the recording to analyze, in corrected clock time."""
+
+    start_iso: str
+    end_iso: str
+    label: str = ""
+
+
+@dataclass
+class GeneralWindowResult:
+    """Everything needed to summarize and redraw one analysis window.
+
+    Timestamps here are on the manifest's own clock, so a later clock
+    correction only has to shift them.
+    """
+
+    label: str
+    start_iso: str
+    end_iso: str
+    pulse_rows: List[Dict[str, Any]]
+    plot_frame: Any
+    peak_points: Any
+    file_count: int = 0
+
+
+@dataclass
+class GeneralPulseAnalysisResult:
+    output_dir: Path
+    aggregated_plot: Path
+    distributions_plot: Path
+    workbook: Path
+    zip_path: Path
+    processed_files: List[Path]
+    analyzed_window_label: str
+    total_pulses: int
+    # Block label (each window, then "Combined") -> metric -> statistic -> value.
+    summaries: Dict[str, Dict[str, Dict[str, float]]]
+    windows: List[GeneralWindowResult]
+    clock_offset_seconds: float
+    manifest_start_iso: str
+    folder_name: str
+    speed_setting: str = "unknown"

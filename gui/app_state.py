@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from services.models import PulseAnalysisResult, ScoreAnalysisResult
+from services.models import AnalysisWindow, GeneralPulseAnalysisResult, PulseAnalysisResult, ScoreAnalysisResult
 
 
 @dataclass
@@ -23,6 +23,9 @@ class AppState:
     score_sleep_minutes: int = 5
     score_result: Optional[ScoreAnalysisResult] = None
     pulse_result: Optional[PulseAnalysisResult] = None
+    general_pulse_result: Optional[GeneralPulseAnalysisResult] = None
+    general_pulse_windows: List[AnalysisWindow] = field(default_factory=list)
+    general_clock_offset_seconds: float = 0.0
 
     def reset_score_flow(self) -> None:
         self.selected_score_file = None
@@ -35,3 +38,6 @@ class AppState:
     def reset_pulse_flow(self) -> None:
         self.selected_pulse_folder = None
         self.pulse_result = None
+        self.general_pulse_result = None
+        self.general_pulse_windows = []
+        self.general_clock_offset_seconds = 0.0
